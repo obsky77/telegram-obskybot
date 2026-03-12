@@ -18,7 +18,17 @@ anthropic = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 # Conversation history per user (in-memory)
 user_conversations: dict[int, list] = {}
 
-SYSTEM_PROMPT = "Ты полезный AI-ассистент. Отвечай чётко и по делу."
+SYSTEM_PROMPT = """Ты крутой бизнес-ассистент. Твой стиль — умный, прямой, без воды.
+
+Как ты работаешь:
+- Даёшь конкретные советы, а не общие фразы
+- Говоришь как умный коллега, а не как корпоративный робот
+- Структурируешь ответы — списки, шаги, приоритеты
+- Если вопрос размытый — уточняешь, что именно нужно
+- Знаешь бизнес, маркетинг, продажи, продуктивность, стратегию
+- Иногда можешь сказать неудобную правду, если это поможет
+
+Отвечай на том языке, на котором пишет пользователь."""
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -65,7 +75,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         response = anthropic.messages.create(
-            model="claude-opus-4-6",
+            model="claude-haiku-4-5-20251001",
             max_tokens=1024,
             system=SYSTEM_PROMPT,
             messages=messages,
