@@ -18,57 +18,134 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-anthropic = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-# Conversation history per user (in-memory)
+# Per-user conversation history (in-memory)
 user_conversations: dict[int, list] = {}
 
 SHEET_URL = os.environ.get(
     "SHEET_URL",
     "https://docs.google.com/spreadsheets/d/12PGjDfUKdpo0oCPJXWIJXigEC78cIchhd2ySyfzJkc4/export?format=csv&gid=469759902"
 )
-CACHE_TTL = 300  # 5 минут
+CACHE_TTL = 300  # 5 minutes
 
 sheet_cache: dict = {"data": None, "updated_at": None}
 
-SYSTEM_PROMPT = """Ты крутой бизнес-ассистент креативного отдела. Твой стиль — умный, прямой, без воды.
+SYSTEM_PROMPT = """\
+Ты крутой бизнес-ассистент креативного отдела. Стиль — умный коллега в рабочем чате.
 
-Как ты работаешь:
-- Даёшь конкретные ответы, а не общие фразы
-- Говоришь как умный коллега, а не как корпоративный робот
-- Структурируешь ответы — списки, шаги, приоритеты
-- Если вопрос размытый — уточняешь, что именно нужно
-- Иногда можешь сказать неудобную правду, если это поможет
+ВАЖНО — как отвечать:
+- Пиши просто и понятно, как человек в чате, а НЕ как робот
+- НЕ используй формат таблиц, pipe-разделители или CSV-вид
+- Пиши короткими живыми предложениями
+- Можешь использовать эмодзи, но без перебора
+- Пример хорошего ответа: "На этой неделе 12 задач в работе, 2 из них горят! 🔥 ВФМ/Екатеринбург и Визитор Центр — оба на Мише, дедлайн 13 марта."
 
-Ты работаешь с еженедельным спринтом креативного отдела. Структура таблицы:
-- Task — название проекта/задачи
+Приоритеты задач:
+- П1 ГОРИМ — горящий, сдать первым
+- П2 — средний
+- П3 — низкий, можно подождать
+- Done — сделано
+- cancel — отменено
+- loser — неактуально
+
+Колонки данных:
+- Task — проект/задача
 - Lid — ответственный лид
 - Lid #2 — второй ответственный
-- Priority — приоритет задачи:
-  * П1 ГОРИМ — САМЫЙ СРОЧНЫЙ, горит, нужно сдать в первую очередь
-  * П2 — средний приоритет
-  * П3 — низкий приоритет, можно подождать
-  * Done — задача выполнена
-  * cancel — задача отменена
-  * loser — задача потеряла актуальность
-- From — кто поставил задачу / источник
-- DD — дедлайн (дата сдачи)
-- Com — комментарии к задаче, важные детали
+- Priority — приоритет
+- From — от кого задача
+- DD — дедлайн
+- Com — комментарии (важные детали!)
 
-Как отвечать на типичные вопросы:
-- "По каким проектам горим?" → показать все задачи с Priority = "П1 ГОРИМ"
-- "Какие задачи сдаём завтра / на этой неделе?" → проверить колонку DD и вывести задачи с ближайшими дедлайнами
-- "Что в работе?" → задачи без статуса Done/cancel, отсортированные по приоритету
-- "Кто чем занимается?" → сгруппировать задачи по Lid
-- Всегда учитывай комментарии (Com) — там важные детали по задачам
+Как отвечать на вопросы:
+- "Горим?" / "Что срочное?" → задачи П1 ГОРИМ с лидами и дедлайнами
+- "Что сдаём завтра/скоро?" → ближайшие дедлайны
+- "Что в работе?" → активные задачи (не Done/cancel/loser), по приоритету
+- "Кто чем занят?" → группируй по лиду
+- Учитывай комментарии — там детали
 
-Сегодняшняя дата: {today}
+Сегодня: {today}
 
-Отвечай на том языке, на котором пишет пользователь."""
+Отвечай на языке пользователя.\
+"""
+
+
+def parse_current_sprint(csv_text: str) -> tuple[str, str]:
+    """Parse CSV, find the LAST sprint section, return only those tasks.
+
+    Returns (sprint_name, formatted_text).
+    """
+    reader = csv.reader(io.StringIO(csv_text))
+    all_rows = list(reader)
+
+    if len(all_rows) < 2:
+        return "", ""
+
+    # First row = headers
+    headers = [h.strip() for h in all_rows[0]]
+
+    # Find ALL "Запланированные задачи" rows — take the LAST one
+    last_sprint_idx = 0
+    sprint_name = "Текущий спринт"
+
+    for i, row in enumerate(all_rows[1:], start=1):
+        for cell in row:
+            if "Запланированные задачи" in cell:
+                last_sprint_idx = i
+                sprint_name = cell.strip()
+                break
+
+    # Take only rows AFTER the last sprint header
+    task_rows = all_rows[last_sprint_idx + 1:]
+
+    # Build readable task list
+    tasks = []
+    for row in task_rows:
+        if not any(cell.strip() for cell in row):
+            continue
+
+        # Map header -> value
+        t = {}
+        for j, val in enumerate(row):
+            if j < len(headers) and headers[j]:
+                t[headers[j]] = val.strip()
+
+        name = t.get("Task", "")
+        if not name or "Запланированные задачи" in name:
+            continue
+
+        # Build a clean readable block for each task
+        num = t.get("№", t.get("#", ""))
+        lines = []
+        prefix = f"{num}. " if num else "• "
+        lines.append(f"{prefix}{name}")
+
+        if t.get("Lid"):
+            lid_str = t["Lid"]
+            if t.get("Lid #2"):
+                lid_str += f", {t['Lid #2']}"
+            lines.append(f"   Лид: {lid_str}")
+
+        if t.get("Priority"):
+            lines.append(f"   Приоритет: {t['Priority']}")
+
+        if t.get("From"):
+            lines.append(f"   От: {t['From']}")
+
+        if t.get("DD"):
+            lines.append(f"   Дедлайн: {t['DD']}")
+
+        if t.get("Com"):
+            lines.append(f"   Ком: {t['Com']}")
+
+        tasks.append("\n".join(lines))
+
+    return sprint_name, "\n\n".join(tasks)
 
 
 def fetch_sheet() -> str | None:
-    """Читает Google Sheet и возвращает данные как текст. Кэш 5 минут."""
+    """Fetch sprint sheet CSV, parse only current sprint, cache 5 min."""
     now = datetime.now()
     cached = sheet_cache["data"]
     updated = sheet_cache["updated_at"]
@@ -79,140 +156,153 @@ def fetch_sheet() -> str | None:
     try:
         resp = requests.get(SHEET_URL, timeout=10)
         resp.raise_for_status()
-        reader = csv.reader(io.StringIO(resp.text))
-        rows = [row for row in reader if any(cell.strip() for cell in row)]
-        text = "\n".join([" | ".join(row) for row in rows])
-        sheet_cache["data"] = text
+        resp.encoding = "utf-8"
+
+        sprint_name, tasks_text = parse_current_sprint(resp.text)
+
+        if not tasks_text:
+            logger.warning("No tasks found in current sprint")
+            return cached
+
+        result = f"Спринт: {sprint_name}\n\n{tasks_text}"
+        sheet_cache["data"] = result
         sheet_cache["updated_at"] = now
-        logger.info("Sheet refreshed: %d rows", len(rows))
-        return text
+        logger.info("Sprint refreshed: %s", sprint_name)
+        return result
+
     except Exception as e:
         logger.error("Sheet fetch error: %s", e)
-        return cached  # вернём старые данные если есть
+        return cached
 
 
-def build_system_prompt_with_sheet() -> str:
-    """Добавляет данные таблицы в системный промпт."""
+def build_system_prompt() -> str:
+    """System prompt + today's date + current sprint data."""
     today = datetime.now().strftime("%d.%m.%Y")
     prompt = SYSTEM_PROMPT.format(today=today)
     data = fetch_sheet()
     if not data:
         return prompt
-    return (
-        prompt
-        + f"\n\n---\nАктуальные данные спринта (обновляется каждые 5 минут):\n\n{data}\n---"
-    )
+    return prompt + f"\n\n---\nДанные текущего спринта:\n\n{data}\n---"
 
+
+# ── Handlers ──────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Привет! Я бизнес-ассистент с доступом к вашей рабочей таблице.\n\n"
-        "Что умею:\n"
-        "• Отвечать на вопросы по задачам и данным из таблицы\n"
-        "• /report — аналитическая сводка по таблице\n"
-        "• /clear — очистить историю диалога\n"
-        "• /help — помощь"
+        "Привет! 👋 Я ассистент креативного отдела.\n\n"
+        "Спрашивай про текущий спринт:\n"
+        "• По каким проектам горим?\n"
+        "• Какие задачи сдаём на этой неделе?\n"
+        "• Кто чем занят?\n\n"
+        "/report — сводка по спринту\n"
+        "/clear — начать заново"
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Команды:\n"
-        "• /report — сводка по данным из таблицы\n"
-        "• /clear — начать диалог заново\n"
-        "• /help — это сообщение\n\n"
-        "Просто пиши вопросы — я вижу данные из таблицы и отвечаю на их основе."
+        "Просто пиши вопросы про спринт — я вижу актуальные задачи.\n\n"
+        "Примеры:\n"
+        "• Что горит?\n"
+        "• Что сдаём завтра?\n"
+        "• Что делает Миша?\n\n"
+        "/report — полная сводка\n"
+        "/clear — очистить историю"
     )
 
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    user_conversations.pop(user_id, None)
-    await update.message.reply_text("История очищена. Начнём заново!")
+    user_conversations.pop(update.effective_user.id, None)
+    await update.message.reply_text("Готово, начнём заново ✨")
 
 
 async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Генерирует аналитическую сводку по таблице."""
+    """Generate a sprint summary."""
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     data = fetch_sheet()
     if not data:
-        await update.message.reply_text("Не удалось загрузить данные из таблицы.")
+        await update.message.reply_text("Не удалось загрузить таблицу 😕")
         return
 
     try:
         today = datetime.now().strftime("%d.%m.%Y")
         prompt = SYSTEM_PROMPT.format(today=today)
-        response = anthropic.messages.create(
+        response = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=2048,
             system=prompt,
             messages=[{
                 "role": "user",
                 "content": (
-                    f"Вот данные текущего спринта:\n\n{data}\n\n"
-                    f"Сегодня {today}. Дай краткую сводку по спринту:\n"
-                    "1. 🔥 П1 ГОРИМ — что горит прямо сейчас\n"
-                    "2. 📅 Ближайшие дедлайны — что сдаём в ближайшие дни\n"
-                    "3. 🔄 В работе — задачи П2 и П3 в процессе\n"
-                    "4. ⚠️ Риски — просроченные или без дедлайна с высоким приоритетом"
+                    f"Данные спринта:\n\n{data}\n\n"
+                    f"Сегодня {today}. Дай короткую живую сводку по спринту:\n"
+                    "- Сколько задач всего, сколько горит\n"
+                    "- Что именно горит (П1) — назови задачи, лидов, дедлайны\n"
+                    "- Ближайшие дедлайны\n"
+                    "- Есть ли просроченные\n"
+                    "Пиши как в рабочем чате, коротко и по делу."
                 )
             }]
         )
-        await update.message.reply_text(response.content[0].text)
+        await _send_long_message(update, response.content[0].text)
     except Exception as e:
         logger.error("Report error: %s", e)
-        await update.message.reply_text("Ошибка при генерации отчёта. Попробуй ещё раз.")
+        await update.message.reply_text("Ошибка при генерации отчёта 🔄")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle free-text messages."""
     user_id = update.effective_user.id
-    user_message = update.message.text
+    text = update.message.text
 
     if user_id not in user_conversations:
         user_conversations[user_id] = []
 
-    user_conversations[user_id].append({"role": "user", "content": user_message})
-
-    # Keep last 20 messages to stay within context limits
+    user_conversations[user_id].append({"role": "user", "content": text})
     messages = user_conversations[user_id][-20:]
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
-        response = anthropic.messages.create(
+        response = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=1024,
-            system=build_system_prompt_with_sheet(),
+            system=build_system_prompt(),
             messages=messages,
         )
-        assistant_text = response.content[0].text
+        reply = response.content[0].text
     except Exception as e:
-        logger.error("Anthropic API error: %s", e)
-        await update.message.reply_text("Произошла ошибка при обращении к AI. Попробуй ещё раз.")
+        logger.error("API error: %s", e)
+        await update.message.reply_text("Ошибка AI, попробуй ещё раз 😕")
         return
 
-    user_conversations[user_id].append({"role": "assistant", "content": assistant_text})
+    user_conversations[user_id].append({"role": "assistant", "content": reply})
+    await _send_long_message(update, reply)
 
-    # Telegram message limit is 4096 chars
-    if len(assistant_text) > 4096:
-        for i in range(0, len(assistant_text), 4096):
-            await update.message.reply_text(assistant_text[i:i + 4096])
+
+async def _send_long_message(update: Update, text: str) -> None:
+    """Split message if it exceeds Telegram's 4096-char limit."""
+    if len(text) <= 4096:
+        await update.message.reply_text(text)
     else:
-        await update.message.reply_text(assistant_text)
+        for i in range(0, len(text), 4096):
+            await update.message.reply_text(text[i:i + 4096])
 
+
+# ── Main ──────────────────────────────────────────────────
 
 def main() -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("report", report))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Bot started with Google Sheets integration")
+    logger.info("Bot started — sprint tracker")
     app.run_polling(drop_pending_updates=True)
 
 
