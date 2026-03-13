@@ -19,6 +19,10 @@ function doPost(e) {
       return updateField(payload);
     }
 
+    if (payload.action === "add_feedback") {
+      return addFeedback(payload);
+    }
+
     if (payload.sheet === "sprint") {
       return addToSprint(payload);
     }
@@ -118,6 +122,43 @@ function updateField(payload) {
   return jsonResponse("error", "Task not found: " + payload.task);
 }
 
+// ── 3. Записать фидбек/сообщение для команды ──────────────
+
+function addFeedback(payload) {
+  var ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  // Ищем лист по имени, затем берём третий по индексу
+  var sheet = ss.getSheetByName("\u041e\u0442\u0437\u044b\u0432\u044b")   // "Отзывы"
+           || ss.getSheetByName("\u0424\u0438\u0434\u0431\u0435\u043a")   // "Фидбек"
+           || ss.getSheetByName("Feedback")
+           || ss.getSheets()[2];  // 3-й лист по порядку
+
+  if (!sheet) return jsonResponse("error", "Feedback sheet not found");
+
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var hasHeaders = headers.some(function(h) { return String(h).trim() !== ""; });
+
+  if (hasHeaders) {
+    var newRow = new Array(headers.length).fill("");
+    // Пробуем по вариантам названий колонок
+    setCol(newRow, headers, "\u0421\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435", payload.message || ""); // Сообщение
+    setCol(newRow, headers, "Message",    payload.message || "");
+    setCol(newRow, headers, "\u041e\u0442 \u043a\u043e\u0433\u043e",  payload.from    || ""); // От кого
+    setCol(newRow, headers, "From",       payload.from    || "");
+    setCol(newRow, headers, "\u041a\u043e\u0433\u0434\u0430",    payload.date    || ""); // Когда
+    setCol(newRow, headers, "Date",       payload.date    || "");
+    sheet.appendRow(newRow);
+  } else {
+    // Нет заголовков — пишем напрямую
+    sheet.appendRow([
+      payload.message || "",
+      payload.from    || "",
+      payload.date    || new Date().toLocaleDateString("ru-RU")
+    ]);
+  }
+
+  return jsonResponse("ok", "Feedback saved");
+}
+
 // ── 4. Добавить задачу в спринт ───────────────────────────
 
 function addToSprint(payload) {
@@ -141,7 +182,7 @@ function addToSprint(payload) {
   return jsonResponse("ok", "Added to sprint: " + payload.task);
 }
 
-// ── 5. Добавить задачу во Входящие ────────────────────────
+// ── 6. Добавить задачу во Входящие ────────────────────────
 
 function addToInbox(payload) {
   var ss    = SpreadsheetApp.openById(SPREADSHEET_ID);

@@ -182,6 +182,36 @@ MORNING_DIGEST_PROMPT = """\
 - Задачи Done и cancel не упоминать
 """
 
+EXTRACT_FEEDBACK_PROMPT = """\
+Пользователь хочет передать фидбек, благодарность или сообщение для команды креативного отдела.
+Извлеки само сообщение — то, что нужно передать команде.
+
+Верни ТОЛЬКО валидный JSON без markdown:
+{"message": "текст сообщения для команды"}
+
+Если сообщение неясно — верни message как пустую строку.
+"""
+
+INSIGHT_PROMPT = """\
+Ты — куратор творческих инсайтов для рекламно-креативной команды.
+Дай один инсайт, цитату или вопрос для разогрева. Каждый раз разный формат:
+
+Форматы (чередуй):
+- Цитата с автором: Рик Рубин, Дэвид Огилви, Пол Арден, Том Гэд, Дон Дрейпер, Джейк Барнетт из Droga5, Ли Клоу, Дэн Вайден, Алекс Осборн
+- Провокационный вопрос: «А что если наш лучший инсайт уже у потребителя, а не у нас?»
+- Творческий принцип: короткое правило, которое помогает делать хорошую работу
+- Инсайт о поведении людей или о рекламе — неочевидный и точный
+
+Правила:
+- Только обычный текст, без *, **, #
+- Максимум 4 строки
+- Живо, дерзко, без воды
+- Если цитата — укажи автора и источник (книга, интервью, кампания)
+- Можно немного провокационно или неожиданно
+
+Отвечай на русском.\
+"""
+
 EXTRACT_UPDATE_FIELD_PROMPT = """\
 Пользователь хочет изменить дедлайн или приоритет задачи в спринте.
 Сегодняшняя дата: {today}.
@@ -219,6 +249,22 @@ INBOX_KEYWORDS = re.compile(
 )
 # Group trigger: «Огент»/«огент» only (not «агент»)
 OGET_RE = re.compile(r"[оО]гент[,!?.]?\s*")
+# Feedback to creative team
+FEEDBACK_RE = re.compile(
+    r"^(передай\s+(команде|ребятам|креативу|дизайнерам|фидбек)"
+    r"|фидбек\s+(для\s+команд|команде)"
+    r"|хочу\s+(поблагодарить|похвалить|сказать\s+спасибо\s+(команде|ребятам))"
+    r"|скажи\s+(команде|ребятам))",
+    re.IGNORECASE
+)
+# Creative insight / quote
+INSIGHT_RE = re.compile(
+    r"(^дай\s+(инсайт|цитату|вдохновение|импульс)"
+    r"|^инсайт$"
+    r"|^вопрос\s+дня"
+    r"|^разогрев)",
+    re.IGNORECASE
+)
 # Set deadline / priority intent
 SET_FIELD_RE = re.compile(
     r"^(поставь|установи|измени|обнови|поменяй|задай|закрой|закрыть|отмени|отменить)\s+"
@@ -603,6 +649,73 @@ async def handle_update_field(update: Update, text: str) -> None:
         sheet_cache["updated_at"] = None
 
 
+# ── Feedback to creative team ─────────────────────────────
+
+async def handle_feedback(update: Update, text: str) -> None:
+    """Extract feedback message, save to feedback sheet via Apps Script."""
+    if not APPS_SCRIPT_URL:
+        await update.message.reply_text("Запись сообщений не настроена (нет APPS_SCRIPT_URL).")
+        return
+
+    sender = update.effective_user
+    username = f"@{sender.username}" if sender.username else sender.full_name or "Неизвестный"
+
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            system=EXTRACT_FEEDBACK_PROMPT,
+            messages=[{"role": "user", "content": text}],
+        )
+        raw = resp.content[0].text.strip()
+        raw = re.sub(r"^```json?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        data = json.loads(raw)
+    except Exception as e:
+        logger.error("Feedback extract error: %s", e)
+        data = {"message": text}
+
+    message = data.get("message", "").strip()
+    if not message:
+        await update.message.reply_text(
+            "Не понял, что передать команде. "
+            "Попробуй: «Передай команде: вы сделали крутой баннер!»"
+        )
+        return
+
+    today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
+    ok = post_to_apps_script({
+        "action": "add_feedback",
+        "message": message,
+        "from": username,
+        "date": today,
+    })
+
+    if ok:
+        await update.message.reply_text(
+            f"Передал команде ✅\n\n«{message}»\n\nОт: {username}"
+        )
+    else:
+        await update.message.reply_text("Не удалось записать — таблица недоступна.")
+
+
+# ── Creative insight ───────────────────────────────────────
+
+async def _generate_insight() -> str:
+    """Generate a single creative insight/quote via Claude."""
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            system=INSIGHT_PROMPT,
+            messages=[{"role": "user", "content": "Дай инсайт"}],
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        logger.error("Insight generation error: %s", e)
+        return ""
+
+
 # ── Morning digest ────────────────────────────────────────
 
 async def _generate_morning_digest() -> str:
@@ -677,16 +790,28 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/hot — самое горящее на сегодня — П1 и ближайшие дедлайны\n"
         "/task — добавить задачу в спринт\n"
         "/digest — утренняя сводка прямо сейчас\n"
+        "/insight — инсайт, цитата или вопрос для разогрева\n"
         "/clear — сбросить контекст разговора\n\n"
-        "Также можно просто написать:\n"
+        "Также можно написать:\n"
         "- Что в работе? Что горит?\n"
         "- Добавь задачу такую-то, дедлайн через неделю\n"
         "- Поставь дедлайн [задача] на 25 марта\n"
         "- Измени приоритет [задача] на П1\n"
-        "- Закрой задачу [название]\n\n"
+        "- Закрой задачу [название]\n"
+        "- Передай команде: вы сделали крутую работу!\n\n"
         "В группе отвечаю на @упоминание или по имени Огент.\n"
         "Утренняя сводка приходит автоматически в 10:00."
     )
+
+
+async def insight_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a creative insight or quote."""
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    text = await _generate_insight()
+    if not text:
+        await update.message.reply_text("Не удалось получить инсайт. Попробуй ещё раз.")
+        return
+    await _send(update, text)
 
 
 async def digest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -849,6 +974,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await handle_inbox_details(update, text)
         return
 
+    # ── Feedback to creative team ──
+    if FEEDBACK_RE.match(text.strip()):
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        await handle_feedback(update, text)
+        return
+
+    # ── Creative insight ──
+    if INSIGHT_RE.match(text.strip()):
+        await insight_cmd(update, context)
+        return
+
     # ── Update comment ──
     if UPDATE_COMMENT_RE.match(text.strip()):
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -941,6 +1077,7 @@ def main() -> None:
     app.add_handler(CommandHandler("hot", hot_cmd))
     app.add_handler(CommandHandler("task", task_cmd))
     app.add_handler(CommandHandler("digest", digest_cmd))
+    app.add_handler(CommandHandler("insight", insight_cmd))
     app.add_handler(CommandHandler("report", report))    # alias → sprint
     app.add_handler(CommandHandler("fire", hot_cmd))     # alias → hot
     app.add_handler(CommandHandler("setgroup", setgroup))
