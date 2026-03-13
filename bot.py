@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import requests
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from anthropic import Anthropic
@@ -114,8 +114,6 @@ INBOX_KEYWORDS = re.compile(
     r"(входящ|задача от|есть задача|передай задачу|пришла задача)",
     re.IGNORECASE
 )
-# Weekdays for scheduled jobs (Mon=0 … Sun=6)
-WEEKDAYS = (0, 1, 2, 3, 4)
 # Group trigger: «Огент»/«огент» only (not «агент»)
 OGET_RE = re.compile(r"[оО]гент[,!?.]?\s*")
 
@@ -365,45 +363,6 @@ async def handle_add_sprint_task(update: Update, text: str) -> None:
         await update.message.reply_text("Не удалось записать в таблицу.")
 
 
-# ── Morning digest job ─────────────────────────────────────
-
-async def today_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Weekday 10:00 Moscow auto-digest to the group (same as /today command)."""
-    if not TELEGRAM_GROUP_ID:
-        return
-
-    data = fetch_sheet()
-    if not data:
-        logger.warning("Today digest: no sheet data")
-        return
-
-    today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
-    prompt = SYSTEM_PROMPT.format(today=today)
-
-    try:
-        resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1024,
-            system=prompt,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Данные спринта:\n\n{data}\n\n"
-                    f"Сегодня {today}. Дневной репорт для команды:\n"
-                    "- Что нужно закрыть сегодня (дедлайн сегодня или уже прошёл)\n"
-                    "- Что в активной работе прямо сейчас (П1, П2 без Done/cancel)\n"
-                    "- Важные комментарии по активным задачам\n"
-                    "В конце — короткое актуальное напутствие или совет для креативной команды на сегодня. "
-                    "Без markdown."
-                )
-            }]
-        )
-        await context.bot.send_message(chat_id=int(TELEGRAM_GROUP_ID), text=resp.content[0].text)
-        logger.info("Today digest sent to group %s", TELEGRAM_GROUP_ID)
-    except Exception as e:
-        logger.error("Today digest error: %s", e)
-
-
 # ── Handlers ──────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -412,9 +371,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "спринты, дедлайны и статусы. Вижу, что горит, что скоро загорится, что уже закрыто.\n\n"
         "Не занимаюсь креативом сам — это не моё. Но слежу, чтобы всё сдавали вовремя "
         "и ничего не разваливалось.\n\n"
-        "/sprint — статус всего спринта\n"
-        "/today — что делаем сегодня\n"
-        "/hot — только П1, самое срочное\n"
+        "/sprint — статус недельного спринта\n"
+        "/hot — самое горящее на сегодня\n"
         "/task — добавить задачу в спринт\n"
         "/help — что умею"
     )
@@ -422,16 +380,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Команды:\n"
-        "/sprint — полный статус недельного спринта по всем проектам\n"
-        "/today — дневной репорт: что на сегодня, совет для команды\n"
-        "/hot — только П1, самое горящее\n"
+        "/sprint — статус недельного спринта по всем проектам\n"
+        "/hot — самое горящее в работе на сегодня — проекты П1 и ближайшие дедлайны\n"
         "/task — добавить задачу в спринт\n"
         "/clear — сбросить контекст разговора\n\n"
         "Также можно просто написать:\n"
-        "- Что в работе? Кто чем занят?\n"
-        "- Добавь Баннер для Сбера, П1, дедлайн 20 марта\n\n"
-        "В группе отвечаю на @упоминание."
+        "- Что в работе? Что горит на сегодня?\n"
+        "- Добавь задачу такую-то, дедлайн через неделю\n\n"
+        "В группе отвечаю на @упоминание или по имени Огент"
     )
 
 
@@ -477,11 +433,11 @@ async def sprint_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 "role": "user",
                 "content": (
                     f"Данные спринта:\n\n{data}\n\n"
-                    f"Сегодня {today}. Перечисли все активные проекты спринта (без Done и cancel) "
-                    "простым списком — каждый с новой строки через дефис. "
-                    "Формат строки: название — дедлайн если есть — комментарий если есть. "
-                    "Никакого деления по приоритетам, никаких секций и заголовков. "
-                    "Просто список проектов. В конце одна строка: сколько всего задач в работе."
+                    f"Сегодня {today}. Полный статус спринта по приоритетам.\n"
+                    "Сначала все П1 ГОРИМ, потом все П2, потом П3 — каждая группа отдельным абзацем с подписью приоритета. "
+                    "Внутри каждой группы — список через дефис: название, дедлайн если есть, комментарий если есть. "
+                    "Задачи Done и cancel не включать. "
+                    "В конце одна строка: сколько всего активных задач."
                 )
             }]
         )
@@ -489,41 +445,6 @@ async def sprint_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception as e:
         logger.error("Sprint error: %s", e)
         await update.message.reply_text("Ошибка при генерации сводки.")
-
-
-async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Daily report: what's on today + creativity tip."""
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-
-    data = fetch_sheet()
-    if not data:
-        await update.message.reply_text("Не удалось загрузить таблицу.")
-        return
-
-    try:
-        today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
-        prompt = SYSTEM_PROMPT.format(today=today)
-        resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1024,
-            system=prompt,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Данные спринта:\n\n{data}\n\n"
-                    f"Сегодня {today}. Дневной репорт для команды:\n"
-                    "- Что нужно закрыть сегодня (дедлайн сегодня или уже прошёл)\n"
-                    "- Что в активной работе прямо сейчас (П1, П2 без Done/cancel)\n"
-                    "- Важные комментарии по активным задачам\n"
-                    "В конце — короткое актуальное напутствие или совет для креативной команды на сегодня. "
-                    "Без markdown."
-                )
-            }]
-        )
-        await _send(update, resp.content[0].text)
-    except Exception as e:
-        logger.error("Today error: %s", e)
-        await update.message.reply_text("Ошибка при генерации.")
 
 
 async def hot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -546,11 +467,10 @@ async def hot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "role": "user",
                 "content": (
                     f"Данные спринта:\n\n{data}\n\n"
-                    f"Сегодня {today}. Только задачи с приоритетом П1 ГОРИМ:\n"
-                    "- Перечисли каждую П1 задачу: название, дедлайн, комментарии\n"
-                    "- Если П1 задач нет — так и скажи\n"
-                    "- Никаких других приоритетов, только П1\n"
-                    "Без markdown. В конце — одна подбадривающая шутка, коротко."
+                    f"Сегодня {today}. Что горит прямо сейчас:\n"
+                    "1. Все П1 ГОРИМ — название, дедлайн, комментарий если есть.\n"
+                    "2. Задачи с дедлайном сегодня или в ближайшие 2 дня (любой приоритет, кроме Done/cancel) — если П1 уже не вошли.\n"
+                    "Если ничего срочного нет — так и скажи. Коротко и по делу."
                 )
             }]
         )
@@ -686,25 +606,12 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("sprint", sprint_cmd))
-    app.add_handler(CommandHandler("today", today_cmd))
     app.add_handler(CommandHandler("hot", hot_cmd))
     app.add_handler(CommandHandler("task", task_cmd))
     app.add_handler(CommandHandler("report", report))    # alias → sprint
     app.add_handler(CommandHandler("fire", hot_cmd))     # alias → hot
     app.add_handler(CommandHandler("setgroup", setgroup))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Today digest: Mon–Fri at 10:00 Moscow time
-    if app.job_queue:
-        app.job_queue.run_daily(
-            today_digest,
-            time=dtime(10, 0, tzinfo=MOSCOW_TZ),
-            days=WEEKDAYS,
-            name="today_digest",
-        )
-        logger.info("Today digest scheduled Mon–Fri at 10:00 Moscow")
-    else:
-        logger.warning("Job queue not available — today digest disabled")
 
     logger.info("Bot started")
     app.run_polling(
