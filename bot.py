@@ -115,6 +115,8 @@ INBOX_KEYWORDS = re.compile(
 )
 # Weekdays for scheduled jobs (Mon=0 … Sun=6)
 WEEKDAYS = (0, 1, 2, 3, 4)
+# Group trigger: «Огент»/«огент» only (not «агент»)
+OGET_RE = re.compile(r"[оО]гент[,!?.]?\s*")
 
 
 # ── Sheet parsing ─────────────────────────────────────────
@@ -588,13 +590,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_type = update.message.chat.type
     is_group = chat_type in ("group", "supergroup")
 
-    # ── Group: only respond when @mentioned ──
+    # ── Group: respond only to @mention or «Огент»/«огент» ──
     if is_group:
         bot_username = context.bot_data.get("username", "")
-        if not bot_username or f"@{bot_username}" not in text.lower():
+        at_mention = bool(bot_username) and f"@{bot_username}" in text.lower()
+        oget_mention = bool(OGET_RE.search(text))
+        if not at_mention and not oget_mention:
             return
-        # Strip @mention before processing
-        text = re.sub(rf"@{re.escape(bot_username)}", "", text, flags=re.IGNORECASE).strip()
+        # Strip both triggers before processing
+        if bot_username:
+            text = re.sub(rf"@{re.escape(bot_username)}", "", text, flags=re.IGNORECASE).strip()
+        text = OGET_RE.sub("", text).strip()
         if not text:
             text = "Что в работе сегодня?"
 
