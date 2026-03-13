@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 from anthropic import Anthropic
@@ -37,6 +37,7 @@ SHEET_URL = os.environ.get(
     "https://docs.google.com/spreadsheets/d/12PGjDfUKdpo0oCPJXWIJXigEC78cIchhd2ySyfzJkc4/export?format=csv&gid=469759902"
 )
 APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "")
+TELEGRAM_GROUP_ID = os.environ.get("TELEGRAM_GROUP_ID", "")
 
 CACHE_TTL = 300
 sheet_cache: dict = {"data": None, "updated_at": None}
@@ -160,6 +161,49 @@ EXTRACT_COMMENT_PROMPT = """\
 Если название задачи неясно — верни task как пустую строку.
 """
 
+MORNING_DIGEST_PROMPT = """\
+Сегодня {today}, {weekday}. Напиши утреннюю сводку для команды.
+
+Данные спринта:
+{data}
+
+Структура сообщения:
+1. Одна живая мотивирующая фраза про день — короткая, без пафоса, можно с юмором.
+2. Раздел «Горит сегодня» — задачи с дедлайном сегодня ИЛИ приоритет «П1 ГОРИМ».
+   Для каждой: название, лид с @ником, дедлайн, комментарий если есть.
+3. Раздел «На подходе» — дедлайны в ближайшие 1–3 дня (не П1, не сегодня).
+   Если таких нет — пропусти раздел.
+4. Если ничего не горит — один абзац: что сейчас активно в работе.
+
+Правила:
+- Только обычный текст, никаких *, **, #, ~
+- @ники берёшь из словаря менеджеров (только если имя есть в словаре)
+- Максимум 20 строк суммарно
+- Задачи Done и cancel не упоминать
+"""
+
+EXTRACT_UPDATE_FIELD_PROMPT = """\
+Пользователь хочет изменить дедлайн или приоритет задачи в спринте.
+Сегодняшняя дата: {today}.
+
+Верни ТОЛЬКО валидный JSON без markdown:
+{{"task": "название задачи", "field": "DD" или "Priority", "value": "новое значение"}}
+
+Правила для field:
+- "DD" — если меняют дедлайн, срок, дату
+- "Priority" — если меняют приоритет, срочность, статус
+
+Правила для value:
+- Если field=DD: дата в формате ДД.ММ.ГГГГ
+- Если field=Priority: только одно из — "П1 ГОРИМ", "П2", "П3", "Done", "cancel"
+
+Примеры:
+- "поставь дедлайн Сбер баннер на 25 марта" → {{"task": "Сбер баннер", "field": "DD", "value": "25.03.2026"}}
+- "измени приоритет ПМФ на П1" → {{"task": "ПМФ", "field": "Priority", "value": "П1 ГОРИМ"}}
+- "закрой задачу Альфа ролик" → {{"task": "Альфа ролик", "field": "Priority", "value": "Done"}}
+- "поменяй срок по Леша на 20 апреля" → {{"task": "Леша", "field": "DD", "value": "20.04.2026"}}
+"""
+
 # ── Intent detection ──────────────────────────────────────
 UPDATE_COMMENT_RE = re.compile(
     r"^(добавь комментарий|обнови комментарий|добавь ком к|обнови ком к|добавь заметку к)",
@@ -175,6 +219,12 @@ INBOX_KEYWORDS = re.compile(
 )
 # Group trigger: «Огент»/«огент» only (not «агент»)
 OGET_RE = re.compile(r"[оО]гент[,!?.]?\s*")
+# Set deadline / priority intent
+SET_FIELD_RE = re.compile(
+    r"^(поставь|установи|измени|обнови|поменяй|задай|закрой|закрыть|отмени|отменить)\s+"
+    r"(дедлайн|приоритет|срок|дату|статус|done|cancel|задачу|проект)",
+    re.IGNORECASE
+)
 
 
 # ── Sheet parsing ─────────────────────────────────────────
@@ -496,6 +546,116 @@ async def handle_update_comment(update: Update, text: str) -> None:
         sheet_cache["updated_at"] = None
 
 
+# ── Update field (deadline / priority) ───────────────────
+
+async def handle_update_field(update: Update, text: str) -> None:
+    """Parse task name + field + value, update via Apps Script."""
+    if not APPS_SCRIPT_URL:
+        await update.message.reply_text("Обновление задач не настроено (нет APPS_SCRIPT_URL).")
+        return
+
+    today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            system=EXTRACT_UPDATE_FIELD_PROMPT.format(today=today),
+            messages=[{"role": "user", "content": text}],
+        )
+        raw = resp.content[0].text.strip()
+        raw = re.sub(r"^```json?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        data = json.loads(raw)
+    except Exception as e:
+        logger.error("Update field extract error: %s", e)
+        await update.message.reply_text(
+            "Не понял. Попробуй: «Поставь дедлайн [задача] на 25 марта» "
+            "или «Измени приоритет [задача] на П1»"
+        )
+        return
+
+    task_name = data.get("task", "").strip()
+    field = data.get("field", "").strip()
+    value = data.get("value", "").strip()
+
+    if not task_name or not field or not value:
+        await update.message.reply_text("Не хватает данных. Укажи задачу, поле и новое значение.")
+        return
+
+    if field not in ("DD", "Priority"):
+        await update.message.reply_text("Могу менять только дедлайн (DD) или приоритет (Priority).")
+        return
+
+    result = query_apps_script({"action": "update_field", "task": task_name, "field": field, "value": value})
+
+    field_ru = "дедлайн" if field == "DD" else "приоритет"
+    if result is None:
+        await update.message.reply_text("Не удалось связаться с таблицей.")
+    elif '"status":"ok"' in (result or "") or '"status": "ok"' in (result or ""):
+        await update.message.reply_text(f"Обновил {field_ru} для «{task_name}»: {value} ✅")
+        sheet_cache["updated_at"] = None
+    elif "not found" in (result or "").lower() or "error" in (result or "").lower():
+        await update.message.reply_text(
+            f"Не нашёл задачу «{task_name}» в текущем спринте. Уточни название."
+        )
+    else:
+        await update.message.reply_text(f"Обновил {field_ru} для «{task_name}»: {value} ✅")
+        sheet_cache["updated_at"] = None
+
+
+# ── Morning digest ────────────────────────────────────────
+
+async def _generate_morning_digest() -> str:
+    """Generate morning digest text using Claude."""
+    data = fetch_sheet()
+    if not data:
+        return ""
+
+    today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
+    weekday_names = {
+        "Monday": "понедельник", "Tuesday": "вторник", "Wednesday": "среда",
+        "Thursday": "четверг", "Friday": "пятница", "Saturday": "суббота", "Sunday": "воскресенье"
+    }
+    weekday = weekday_names.get(datetime.now(MOSCOW_TZ).strftime("%A"), "")
+
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            system=build_base_prompt(),
+            messages=[{
+                "role": "user",
+                "content": MORNING_DIGEST_PROMPT.format(
+                    today=today,
+                    weekday=weekday,
+                    data=data,
+                ),
+            }],
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        logger.error("Morning digest generation error: %s", e)
+        return ""
+
+
+async def morning_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Daily 10:00 Moscow job — sends morning digest to the group."""
+    if not TELEGRAM_GROUP_ID:
+        logger.warning("TELEGRAM_GROUP_ID not set, skipping morning digest")
+        return
+
+    text = await _generate_morning_digest()
+    if not text:
+        logger.warning("Empty morning digest, skipping send")
+        return
+
+    try:
+        await context.bot.send_message(chat_id=int(TELEGRAM_GROUP_ID), text=text)
+        logger.info("Morning digest sent to group %s", TELEGRAM_GROUP_ID)
+    except Exception as e:
+        logger.error("Morning digest send error: %s", e)
+
+
 # ── Handlers ──────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -514,14 +674,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "/sprint — статус недельного спринта по всем проектам\n"
-        "/hot — самое горящее в работе на сегодня — проекты П1 и ближайшие дедлайны\n"
+        "/hot — самое горящее на сегодня — П1 и ближайшие дедлайны\n"
         "/task — добавить задачу в спринт\n"
+        "/digest — утренняя сводка прямо сейчас\n"
         "/clear — сбросить контекст разговора\n\n"
         "Также можно просто написать:\n"
-        "- Что в работе? Что горит на сегодня?\n"
-        "- Добавь задачу такую-то, дедлайн через неделю\n\n"
-        "В группе отвечаю на @упоминание или по имени Огент"
+        "- Что в работе? Что горит?\n"
+        "- Добавь задачу такую-то, дедлайн через неделю\n"
+        "- Поставь дедлайн [задача] на 25 марта\n"
+        "- Измени приоритет [задача] на П1\n"
+        "- Закрой задачу [название]\n\n"
+        "В группе отвечаю на @упоминание или по имени Огент.\n"
+        "Утренняя сводка приходит автоматически в 10:00."
     )
+
+
+async def digest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manual trigger for morning digest."""
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    text = await _generate_morning_digest()
+    if not text:
+        await update.message.reply_text("Не удалось сформировать сводку — нет данных из таблицы.")
+        return
+    await _send(update, text)
+    # Also post to group if called from a different chat
+    if TELEGRAM_GROUP_ID and str(update.effective_chat.id) != TELEGRAM_GROUP_ID:
+        try:
+            await context.bot.send_message(chat_id=int(TELEGRAM_GROUP_ID), text=text)
+        except Exception as e:
+            logger.error("digest_cmd group send error: %s", e)
 
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -674,6 +855,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await handle_update_comment(update, text)
         return
 
+    # ── Set deadline / priority ──
+    if SET_FIELD_RE.match(text.strip()):
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        await handle_update_field(update, text)
+        return
+
     # ── Add to sprint ──
     if ADD_KEYWORDS.match(text.strip()):
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -723,10 +910,18 @@ async def _send(update: Update, text: str) -> None:
 # ── Main ──────────────────────────────────────────────────
 
 async def post_init(app: Application) -> None:
-    """Cache bot username at startup so group mention detection is fast & reliable."""
+    """Cache bot username and schedule morning digest at 10:00 Moscow."""
     me = await app.bot.get_me()
     app.bot_data["username"] = me.username.lower()
     logger.info("Bot username cached: @%s", me.username)
+
+    if app.job_queue:
+        app.job_queue.run_daily(
+            morning_digest_job,
+            time=dtime(10, 0, 0, tzinfo=MOSCOW_TZ),
+            name="morning_digest",
+        )
+        logger.info("Morning digest job scheduled at 10:00 Moscow")
 
 
 def main() -> None:
@@ -745,6 +940,7 @@ def main() -> None:
     app.add_handler(CommandHandler("sprint", sprint_cmd))
     app.add_handler(CommandHandler("hot", hot_cmd))
     app.add_handler(CommandHandler("task", task_cmd))
+    app.add_handler(CommandHandler("digest", digest_cmd))
     app.add_handler(CommandHandler("report", report))    # alias → sprint
     app.add_handler(CommandHandler("fire", hot_cmd))     # alias → hot
     app.add_handler(CommandHandler("setgroup", setgroup))

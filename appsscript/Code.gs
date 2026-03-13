@@ -15,6 +15,10 @@ function doPost(e) {
       return updateComment(payload);
     }
 
+    if (payload.action === "update_field") {
+      return updateField(payload);
+    }
+
     if (payload.sheet === "sprint") {
       return addToSprint(payload);
     }
@@ -48,7 +52,17 @@ function updateComment(payload) {
   var searchName = (payload.task || "").toLowerCase().trim();
   if (!searchName) return jsonResponse("error", "Task name is empty");
 
-  for (var row = 1; row < data.length; row++) {
+  // Находим последний маркер «Запланированные задачи» — начало актуального спринта
+  var sprintStart = 1; // по умолчанию — после заголовков
+  for (var r = 1; r < data.length; r++) {
+    for (var c = 0; c < data[r].length; c++) {
+      if (String(data[r][c]).indexOf("Запланированные задачи") !== -1) {
+        sprintStart = r + 1; // строки после маркера
+      }
+    }
+  }
+
+  for (var row = sprintStart; row < data.length; row++) {
     var cellValue = String(data[row][taskCol]).toLowerCase().trim();
     if (!cellValue) continue;
 
@@ -64,7 +78,47 @@ function updateComment(payload) {
   return jsonResponse("error", "Task not found: " + payload.task);
 }
 
-// ── 2. Добавить задачу в спринт ───────────────────────────
+// ── 2. Обновить поле задачи (дедлайн или приоритет) ───────
+
+function updateField(payload) {
+  var sheet = getSprintSheet();
+  if (!sheet) return jsonResponse("error", "Sprint sheet not found");
+
+  var data = sheet.getDataRange().getValues();
+  var headers = data[0];
+
+  var taskCol  = findCol(headers, "Task");
+  var fieldCol = findCol(headers, payload.field || "");
+
+  if (taskCol  === -1) return jsonResponse("error", "Column 'Task' not found");
+  if (fieldCol === -1) return jsonResponse("error", "Column '" + payload.field + "' not found");
+
+  var searchName = (payload.task || "").toLowerCase().trim();
+  if (!searchName) return jsonResponse("error", "Task name is empty");
+
+  // Only search current sprint (after last marker)
+  var sprintStart = 1;
+  for (var r = 1; r < data.length; r++) {
+    for (var c = 0; c < data[r].length; c++) {
+      if (String(data[r][c]).indexOf("Запланированные задачи") !== -1) {
+        sprintStart = r + 1;
+      }
+    }
+  }
+
+  for (var row = sprintStart; row < data.length; row++) {
+    var cellValue = String(data[row][taskCol]).toLowerCase().trim();
+    if (!cellValue) continue;
+    if (cellValue.indexOf(searchName) !== -1 || searchName.indexOf(cellValue) !== -1) {
+      sheet.getRange(row + 1, fieldCol + 1).setValue(payload.value || "");
+      return jsonResponse("ok", "Updated " + payload.field + " for: " + data[row][taskCol]);
+    }
+  }
+
+  return jsonResponse("error", "Task not found: " + payload.task);
+}
+
+// ── 4. Добавить задачу в спринт ───────────────────────────
 
 function addToSprint(payload) {
   var sheet = getSprintSheet();
@@ -87,7 +141,7 @@ function addToSprint(payload) {
   return jsonResponse("ok", "Added to sprint: " + payload.task);
 }
 
-// ── 3. Добавить задачу во Входящие ────────────────────────
+// ── 5. Добавить задачу во Входящие ────────────────────────
 
 function addToInbox(payload) {
   var ss    = SpreadsheetApp.openById(SPREADSHEET_ID);
