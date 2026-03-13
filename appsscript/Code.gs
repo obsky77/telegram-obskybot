@@ -4,6 +4,7 @@
 
 var SPREADSHEET_ID = "12PGjDfUKdpo0oCPJXWIJXigEC78cIchhd2ySyfzJkc4";
 var SPRINT_SHEET_GID = 469759902;  // gid вкладки спринта
+var DRIVE_FOLDER_ID  = "1oWKcFJpliR9GxnBZ56Els8nCdkfuE8s_";  // корневая папка с проектами
 
 // ── Entry point ────────────────────────────────────────────
 
@@ -21,6 +22,10 @@ function doPost(e) {
 
     if (payload.action === "add_feedback") {
       return addFeedback(payload);
+    }
+
+    if (payload.action === "search_drive") {
+      return searchDrive(payload);
     }
 
     if (payload.sheet === "sprint") {
@@ -210,6 +215,74 @@ function addToInbox(payload) {
   }
 
   return jsonResponse("ok", "Added to inbox: " + payload.task);
+}
+
+// ── 5. Поиск папки проекта в Google Drive ─────────────────
+
+function searchDrive(payload) {
+  var query = String(payload.query || "").trim();
+  if (!query) return driveJsonResponse("error", "Query is empty");
+
+  var rootFolder;
+  try {
+    rootFolder = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+  } catch (err) {
+    return driveJsonResponse("error", "Cannot access root folder: " + err.toString());
+  }
+
+  var queryLower = query.toLowerCase();
+  var subfolders;
+  try {
+    subfolders = rootFolder.getFolders();
+  } catch (err) {
+    return driveJsonResponse("error", "Cannot list subfolders: " + err.toString());
+  }
+
+  var matches = [];
+  var folderCount = 0;
+  var MAX_FOLDERS = 100;
+  var MAX_FILES   = 50;
+
+  while (subfolders.hasNext() && folderCount < MAX_FOLDERS) {
+    folderCount++;
+    var folder = subfolders.next();
+    var folderName      = folder.getName();
+    var folderNameLower = folderName.toLowerCase();
+
+    // Bidirectional partial match, case-insensitive
+    var isMatch = (folderNameLower.indexOf(queryLower) !== -1)
+               || (queryLower.indexOf(folderNameLower) !== -1);
+    if (!isMatch) continue;
+
+    var filesResult = [];
+    var fileCount = 0;
+    try {
+      var files = folder.getFiles();
+      while (files.hasNext() && fileCount < MAX_FILES) {
+        fileCount++;
+        var file = files.next();
+        filesResult.push({ name: file.getName(), url: file.getUrl() });
+      }
+    } catch (fileErr) {
+      // папка возвращается даже если файлы недоступны
+    }
+
+    matches.push({ name: folderName, url: folder.getUrl(), files: filesResult });
+  }
+
+  if (matches.length === 0) {
+    return driveJsonResponse("not_found", "No folders matching: " + query);
+  }
+
+  return ContentService
+    .createTextOutput(JSON.stringify({ status: "ok", matches: matches }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function driveJsonResponse(status, message) {
+  return ContentService
+    .createTextOutput(JSON.stringify({ status: status, message: message }))
+    .setMimeType(ContentService.MimeType.JSON);
 }
 
 // ── Helpers ────────────────────────────────────────────────

@@ -212,6 +212,21 @@ INSIGHT_PROMPT = """\
 Отвечай на русском.\
 """
 
+EXTRACT_FILE_QUERY_PROMPT = """\
+Пользователь ищет папку или файл в Google Drive. Извлеки название проекта из его сообщения.
+
+Верни ТОЛЬКО валидный JSON без markdown:
+{"query": "название проекта или ключевое слово"}
+
+Примеры:
+- "Где презентация по ПМФ?" → {"query": "ПМФ"}
+- "найди файлы по Сберу" → {"query": "Сбер"}
+- "дай ссылку на папку Альфа ролик" → {"query": "Альфа ролик"}
+- "покажи материалы по брифу МТС" → {"query": "МТС"}
+
+Только ключевое слово/название проекта, без лишних слов.
+"""
+
 EXTRACT_UPDATE_FIELD_PROMPT = """\
 Пользователь хочет изменить дедлайн или приоритет задачи в спринте.
 Сегодняшняя дата: {today}.
@@ -269,6 +284,15 @@ INSIGHT_RE = re.compile(
 SET_FIELD_RE = re.compile(
     r"^(поставь|установи|измени|обнови|поменяй|задай|закрой|закрыть|отмени|отменить)\s+"
     r"(дедлайн|приоритет|срок|дату|статус|done|cancel|задачу|проект)",
+    re.IGNORECASE
+)
+# Find file / Drive folder
+FIND_FILE_RE = re.compile(
+    r"(где\s+(файл|папк|презентац|материал|бриф|ссылк|видео|документ)"
+    r"|найди\s+(файл|папк|презентац|материал|бриф)"
+    r"|дай\s+ссылку\s+на"
+    r"|покажи\s+(материал|файл|папк|презентац|бриф)"
+    r"|есть\s+ли\s+(файл|папк|материал))",
     re.IGNORECASE
 )
 
@@ -699,6 +723,101 @@ async def handle_feedback(update: Update, text: str) -> None:
         await update.message.reply_text("Не удалось записать — таблица недоступна.")
 
 
+# ── Find file in Drive ────────────────────────────────────
+
+async def handle_find_file(update: Update, text: str) -> None:
+    """Extract project name via Claude, search Drive via Apps Script, format response."""
+    if not APPS_SCRIPT_URL:
+        await update.message.reply_text(
+            "Поиск по Drive не настроен (нет APPS_SCRIPT_URL)."
+        )
+        return
+
+    # Step 1: Extract the query keyword via Claude Haiku
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=100,
+            system=EXTRACT_FILE_QUERY_PROMPT,
+            messages=[{"role": "user", "content": text}],
+        )
+        raw = resp.content[0].text.strip()
+        raw = re.sub(r"^```json?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        query = json.loads(raw).get("query", "").strip()
+    except Exception as e:
+        logger.error("File query extract: %s", e)
+        query = text.strip()
+
+    if not query:
+        await update.message.reply_text("Не понял, что ищем. Попробуй: /file ПМФ")
+        return
+
+    # Step 2: Call Apps Script
+    raw_result = query_apps_script({"action": "search_drive", "query": query})
+    if raw_result is None:
+        await update.message.reply_text("Не удалось связаться с Google Drive.")
+        return
+
+    # Step 3: Parse response
+    try:
+        result = json.loads(raw_result)
+    except Exception as e:
+        logger.error("Drive search JSON parse: %s | raw: %s", e, raw_result)
+        await update.message.reply_text("Странный ответ от Drive, попробуй ещё раз.")
+        return
+
+    status = result.get("status", "")
+
+    if status == "not_found":
+        await update.message.reply_text(f"Папок по запросу «{query}» не нашёл.")
+        return
+    if status != "ok":
+        await update.message.reply_text(
+            f"Ошибка Drive: {result.get('message', '?')}"
+        )
+        return
+
+    matches = result.get("matches", [])
+    if not matches:
+        await update.message.reply_text(f"Папок по запросу «{query}» не нашёл.")
+        return
+
+    # Step 4: Format response — plain text, no markdown
+    lines = []
+    for idx, folder in enumerate(matches):
+        folder_name = folder.get("name", "")
+        folder_url  = folder.get("url", "")
+        files       = folder.get("files", [])
+
+        if len(matches) > 1:
+            lines.append(f"Папка {idx + 1}. {folder_name}:")
+        else:
+            lines.append(f'Папка "{folder_name}":')
+        lines.append(folder_url)
+
+        if files:
+            lines.append(f"\nФайлы ({len(files)}):")
+            for i, f in enumerate(files, 1):
+                lines.append(f"{i}. {f['name']} — {f['url']}")
+        else:
+            lines.append("(папка пустая или файлы недоступны)")
+
+        if idx < len(matches) - 1:
+            lines.append("")
+
+    await _send(update, "\n".join(lines))
+
+
+async def file_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search Drive for a project folder. Usage: /file ПМФ"""
+    if context.args:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        await handle_find_file(update, " ".join(context.args))
+    else:
+        await update.message.reply_text("Укажи название проекта. Пример: /file ПМФ")
+
+
 # ── Creative insight ───────────────────────────────────────
 
 async def _generate_insight() -> str:
@@ -789,6 +908,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/sprint — статус недельного спринта по всем проектам\n"
         "/hot — самое горящее на сегодня — П1 и ближайшие дедлайны\n"
         "/task — добавить задачу в спринт\n"
+        "/file [проект] — найти папку и файлы в Google Drive\n"
         "/digest — утренняя сводка прямо сейчас\n"
         "/insight — инсайт, цитата или вопрос для разогрева\n"
         "/clear — сбросить контекст разговора\n\n"
@@ -798,6 +918,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "- Поставь дедлайн [задача] на 25 марта\n"
         "- Измени приоритет [задача] на П1\n"
         "- Закрой задачу [название]\n"
+        "- Где презентация по ПМФ? / Найди файлы по Сберу\n"
         "- Передай команде: вы сделали крутую работу!\n\n"
         "В группе отвечаю на @упоминание или по имени Огент.\n"
         "Утренняя сводка приходит автоматически в 10:00."
@@ -974,6 +1095,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await handle_inbox_details(update, text)
         return
 
+    # ── Find file / Drive folder ──
+    if FIND_FILE_RE.search(text.strip()):
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        await handle_find_file(update, text)
+        return
+
     # ── Feedback to creative team ──
     if FEEDBACK_RE.match(text.strip()):
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -1076,6 +1203,7 @@ def main() -> None:
     app.add_handler(CommandHandler("sprint", sprint_cmd))
     app.add_handler(CommandHandler("hot", hot_cmd))
     app.add_handler(CommandHandler("task", task_cmd))
+    app.add_handler(CommandHandler("file", file_cmd))
     app.add_handler(CommandHandler("digest", digest_cmd))
     app.add_handler(CommandHandler("insight", insight_cmd))
     app.add_handler(CommandHandler("report", report))    # alias → sprint
