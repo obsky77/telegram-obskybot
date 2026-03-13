@@ -115,10 +115,40 @@ EXTRACT_INBOX_PROMPT = """\
 """
 
 # ── Managers: name → Telegram @username ───────────────────
-# Заполни: {"Имя": "@username", ...}
 MANAGERS: dict[str, str] = {
-    # "Алёна": "@alena_tg",
-    # "Иван": "@ivan_tg",
+    # Менеджеры
+    "Костя": "@sunshine_insomnia",
+    "Костя Поляничев": "@sunshine_insomnia",
+    "Поляничев": "@sunshine_insomnia",
+    "Леша": "@cheeenoo",
+    "Лёша": "@cheeenoo",
+    "Алексей": "@cheeenoo",
+    "Леша Ксенофонтов": "@cheeenoo",
+    "Ксенофонтов": "@cheeenoo",
+    "Света": "@Sveta_enjoy",
+    "Андрей": "@funkitright",
+    "Андрей Морозов": "@funkitright",
+    "Морозов": "@funkitright",
+    "Саша": "@alexa_moiseeva",
+    "Саша Моисеева": "@alexa_moiseeva",
+    "Моисеева": "@alexa_moiseeva",
+    "Алена": "@romanovskaya_aln",
+    "Алёна": "@romanovskaya_aln",
+    "Маша": "@maryanash",
+    "Илья": "@Daikon25",
+    "Илья Викторович": "@Daikon25",
+    "Роза": "@rosanna_oganyan",
+    "Таня": "@TannyaT",
+    "Марина": "@MarinaGlmzv",
+    "Евгения": "@mevgeniia",
+    "Женя": "@mevgeniia",
+    "Лера": "@lmorgunova",
+    # Сотрудники креатива
+    "Олег": "@obsky",
+    "Миша": "@mksktn",
+    "Настя Девяткина": "@anastasia_9d10d",
+    "Настя Арончик": "@aronchik_a",
+    "Настя": "@anastasia_9d10d",
 }
 
 EXTRACT_COMMENT_PROMPT = """\
