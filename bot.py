@@ -112,6 +112,8 @@ INBOX_KEYWORDS = re.compile(
     r"(входящ|задача от|есть задача|передай задачу|пришла задача)",
     re.IGNORECASE
 )
+# Matches: Агент, агент, Огент, огент — with optional punctuation after
+AGENT_MENTION_RE = re.compile(r"[аАоО]гент[,!?.]?\s*", re.IGNORECASE)
 
 
 # ── Sheet parsing ─────────────────────────────────────────
@@ -408,21 +410,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "спринты, дедлайны и статусы. Вижу, что горит, что скоро загорится, что уже закрыто.\n\n"
         "Не занимаюсь креативом сам — это не моё. Но слежу, чтобы всё сдавали вовремя "
         "и ничего не разваливалось.\n\n"
-        "Можете написать мне задачу — добавлю в спринт.\n\n"
-        "/report — сводка по спринту\n"
+        "/sprint — полная сводка по спринту\n"
+        "/fire — что горит прямо сейчас\n"
+        "/task — добавить задачу в спринт\n"
         "/help — что умею"
     )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Что умею:\n"
-        "- Ответить про статус спринта: что горит, что сдаём, кто чем занят\n"
-        "- Добавить задачу в спринт: Добавь Название, П1, дедлайн 25 марта\n"
-        "- Зафиксировать входящую задачу: Задача от Ани — нужен баннер\n"
-        "- В группе отвечаю на @упоминание или слово Агент\n\n"
-        "/report — полная сводка по спринту\n"
-        "/clear — сбросить контекст разговора"
+        "Команды:\n"
+        "/sprint — полная сводка: всё в работе, дедлайны, комментарии\n"
+        "/fire — только горящее: П1 и просроченные\n"
+        "/task — добавить задачу в спринт\n"
+        "/clear — сбросить контекст разговора\n\n"
+        "Также можно просто написать:\n"
+        "- Что в работе? Кто чем занят?\n"
+        "- Добавь Баннер для Сбера, П1, дедлайн 20 марта\n"
+        "- Задача от Ани — нужен ролик\n\n"
+        "В группе отвечаю на @упоминание или слово Агент/Огент."
     )
 
 
@@ -448,7 +454,8 @@ async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def sprint_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Full sprint report."""
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     data = fetch_sheet()
@@ -467,7 +474,7 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "role": "user",
                 "content": (
                     f"Данные спринта:\n\n{data}\n\n"
-                    f"Сегодня {today}. Сводка как траффик-менеджер:\n"
+                    f"Сегодня {today}. Полная сводка по спринту:\n"
                     "- Сколько задач в работе, сколько горит\n"
                     "- П1 с дедлайнами\n"
                     "- П2 на подходе\n"
@@ -479,8 +486,62 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         await _send(update, resp.content[0].text)
     except Exception as e:
-        logger.error("Report error: %s", e)
-        await update.message.reply_text("Ошибка при генерации отчёта.")
+        logger.error("Sprint error: %s", e)
+        await update.message.reply_text("Ошибка при генерации сводки.")
+
+
+async def fire_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Only burning tasks: П1 and overdue."""
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    data = fetch_sheet()
+    if not data:
+        await update.message.reply_text("Не удалось загрузить таблицу.")
+        return
+
+    try:
+        today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
+        prompt = SYSTEM_PROMPT.format(today=today)
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            system=prompt,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Данные спринта:\n\n{data}\n\n"
+                    f"Сегодня {today}. Только горящее:\n"
+                    "- Все П1 задачи с их статусом и дедлайнами\n"
+                    "- Просроченные задачи любого приоритета\n"
+                    "- Что важного в их комментариях\n"
+                    "Без markdown. В конце — одна мотивирующая шутка, коротко."
+                )
+            }]
+        )
+        await _send(update, resp.content[0].text)
+    except Exception as e:
+        logger.error("Fire error: %s", e)
+        await update.message.reply_text("Ошибка при генерации.")
+
+
+async def task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add a task to sprint. If args provided — parse directly. Else — ask."""
+    if context.args:
+        text = " ".join(context.args)
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        await handle_add_sprint_task(update, text)
+    else:
+        user_id = update.effective_user.id
+        user_states[user_id] = {"state": "awaiting_task_input"}
+        await update.message.reply_text(
+            "Опиши задачу — название, приоритет и дедлайн если есть.\n"
+            "Пример: Баннер для Сбера, П1, дедлайн 20 марта"
+        )
+
+
+# keep /report as alias for backward compat
+async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await sprint_cmd(update, context)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -492,23 +553,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_type = update.message.chat.type
     is_group = chat_type in ("group", "supergroup")
 
-    # ── Group: only respond when mentioned or called "Агент" ──
+    # ── Group: only respond when @mentioned or called "Агент"/"Огент" ──
     if is_group:
         bot_username = (await context.bot.get_me()).username
-        mentioned = (
-            f"@{bot_username}".lower() in text.lower()
-            or re.search(r"\bагент\b", text, re.IGNORECASE)
-        )
-        if not mentioned:
+        at_mention = f"@{bot_username}".lower() in text.lower()
+        agent_mention = bool(AGENT_MENTION_RE.search(text))
+        if not at_mention and not agent_mention:
             return
-        # Strip mention from text before processing
+        # Strip mention tokens before processing
         text = re.sub(rf"@{re.escape(bot_username)}", "", text, flags=re.IGNORECASE).strip()
-        text = re.sub(r"\bагент[,!?.]?\s*", "", text, flags=re.IGNORECASE).strip()
+        text = AGENT_MENTION_RE.sub("", text).strip()
         if not text:
             text = "Что в работе сегодня?"
 
-    # ── Multi-step state: user is providing inbox task details ──
+    # ── Multi-step state ──
     state_info = user_states.get(user_id, {})
+
+    if state_info.get("state") == "awaiting_task_input":
+        user_states.pop(user_id, None)
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        await handle_add_sprint_task(update, text)
+        return
+
     if state_info.get("state") == "awaiting_inbox_details":
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
         await handle_inbox_details(update, text)
@@ -570,7 +636,10 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("clear", clear))
-    app.add_handler(CommandHandler("report", report))
+    app.add_handler(CommandHandler("sprint", sprint_cmd))
+    app.add_handler(CommandHandler("fire", fire_cmd))
+    app.add_handler(CommandHandler("task", task_cmd))
+    app.add_handler(CommandHandler("report", report))   # backward compat alias
     app.add_handler(CommandHandler("setgroup", setgroup))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
