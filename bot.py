@@ -320,6 +320,57 @@ FIND_FILE_RE = re.compile(
 
 # ── Sheet parsing ─────────────────────────────────────────
 
+def _annotate_deadline(dd_str: str, today) -> str:
+    """Parse DD field and append a human-readable relative label.
+
+    Supported input formats: DD.MM.YYYY, DD.MM.YY, DD.MM
+    Returns original string unchanged if it cannot be parsed.
+    """
+    s = dd_str.strip()
+    if not s:
+        return s
+
+    parsed = None
+    for fmt in ("%d.%m.%Y", "%d.%m.%y", "%d.%m"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            if fmt == "%d.%m":
+                # Assume current year; if that date already passed this year
+                # and is more than 30 days ago, assume next year
+                dt = dt.replace(year=today.year)
+                if (dt.date() - today).days < -30:
+                    dt = dt.replace(year=today.year + 1)
+            elif fmt == "%d.%m.%y":
+                # strptime maps 2-digit year: 25 → 2025
+                pass
+            parsed = dt.date()
+            break
+        except ValueError:
+            continue
+
+    if parsed is None:
+        return s  # unknown format — leave as-is
+
+    delta = (parsed - today).days
+
+    if delta < -1:
+        label = f"просрочено {abs(delta)} дн."
+    elif delta == -1:
+        label = "просрочено вчера"
+    elif delta == 0:
+        label = "сегодня!"
+    elif delta == 1:
+        label = "завтра"
+    elif delta == 2:
+        label = "послезавтра"
+    elif delta <= 7:
+        label = f"через {delta} дн."
+    else:
+        label = f"через {delta} дн."
+
+    return f"{s} ({label})"
+
+
 def parse_current_sprint(csv_text: str) -> tuple[str, str]:
     reader = csv.reader(io.StringIO(csv_text))
     all_rows = list(reader)
@@ -340,6 +391,7 @@ def parse_current_sprint(csv_text: str) -> tuple[str, str]:
                 break
 
     task_rows = all_rows[last_sprint_idx + 1:]
+    today_date = datetime.now(MOSCOW_TZ).date()
 
     tasks = []
     for row in task_rows:
@@ -373,7 +425,7 @@ def parse_current_sprint(csv_text: str) -> tuple[str, str]:
             lines.append(f"   От: {t['From']}")
 
         if t.get("DD"):
-            lines.append(f"   Дедлайн: {t['DD']}")
+            lines.append(f"   Дедлайн: {_annotate_deadline(t['DD'], today_date)}")
 
         if t.get("Com"):
             lines.append(f"   Ком: {t['Com']}")
