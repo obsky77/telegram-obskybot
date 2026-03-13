@@ -60,6 +60,7 @@ SYSTEM_PROMPT = """\
 - Читай комментарии (Com) — там детали по задачам, всегда учитывай
 - Приоритеты важнее имён — говори П1, П2, П3, не перечисляй всех подряд
 - Если спрашивают конкретно про человека — отвечай
+- Никогда не делай выводы о том, что конкретный человек перегружен или недозагружен — только общее количество задач по отделу
 
 Приоритеты:
 - П1 ГОРИМ — сдать первым, срочно
@@ -491,7 +492,7 @@ async def sprint_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def fire_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Only burning tasks: П1 and overdue."""
+    """Only П1 tasks."""
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     data = fetch_sheet()
@@ -510,10 +511,10 @@ async def fire_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "role": "user",
                 "content": (
                     f"Данные спринта:\n\n{data}\n\n"
-                    f"Сегодня {today}. Только горящее:\n"
-                    "- Все П1 задачи с их статусом и дедлайнами\n"
-                    "- Просроченные задачи любого приоритета\n"
-                    "- Что важного в их комментариях\n"
+                    f"Сегодня {today}. Только задачи с приоритетом П1 ГОРИМ:\n"
+                    "- Перечисли каждую П1 задачу: название, дедлайн, комментарии\n"
+                    "- Если П1 задач нет — так и скажи\n"
+                    "- Никаких других приоритетов, только П1\n"
                     "Без markdown. В конце — одна мотивирующая шутка, коротко."
                 )
             }]
@@ -555,13 +556,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # ── Group: only respond when @mentioned or called "Агент"/"Огент" ──
     if is_group:
-        bot_username = (await context.bot.get_me()).username
-        at_mention = f"@{bot_username}".lower() in text.lower()
+        bot_username = context.bot_data.get("username", "")
+        at_mention = bool(bot_username) and f"@{bot_username}" in text.lower()
         agent_mention = bool(AGENT_MENTION_RE.search(text))
         if not at_mention and not agent_mention:
             return
         # Strip mention tokens before processing
-        text = re.sub(rf"@{re.escape(bot_username)}", "", text, flags=re.IGNORECASE).strip()
+        if bot_username:
+            text = re.sub(rf"@{re.escape(bot_username)}", "", text, flags=re.IGNORECASE).strip()
         text = AGENT_MENTION_RE.sub("", text).strip()
         if not text:
             text = "Что в работе сегодня?"
@@ -628,9 +630,21 @@ async def _send(update: Update, text: str) -> None:
 
 # ── Main ──────────────────────────────────────────────────
 
+async def post_init(app: Application) -> None:
+    """Cache bot username at startup so group mention detection is fast & reliable."""
+    me = await app.bot.get_me()
+    app.bot_data["username"] = me.username.lower()
+    logger.info("Bot username cached: @%s", me.username)
+
+
 def main() -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(post_init)
+        .build()
+    )
 
     # Handlers
     app.add_handler(CommandHandler("start", start))
@@ -655,7 +669,10 @@ def main() -> None:
         logger.warning("Job queue not available — morning digest disabled")
 
     logger.info("Bot started")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "edited_message", "callback_query"],
+    )
 
 
 if __name__ == "__main__":
