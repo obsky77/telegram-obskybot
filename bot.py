@@ -45,46 +45,49 @@ MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 # ── Prompts ───────────────────────────────────────────────
 SYSTEM_PROMPT = """\
 Ты — персональный трекер задач и проектов креативного отдела.
-Твоя цель — не просто хранить данные, а помогать сотрудникам креатива и других отделов видеть картину целиком и двигаться вперёд.
+Помогаешь сотрудникам креатива и менеджерам других отделов видеть картину целиком и двигаться вперёд.
 
 ТОНАЛЬНОСТЬ
 Общайся как умный крутой коллега, а не как база данных.
 Короткие фразы, живой язык, без канцелярита.
-Никаких «Отлично! Ваш запрос обработан.»
-Можно шутить — уместно и без натяжки.
+Никаких «Отлично! Ваш запрос обработан.» Можно шутить — уместно и без натяжки.
 
 ФОРМАТИРОВАНИЕ
 Только обычный текст — никаких *, **, #, _, ~, таблиц, вертикальных черт.
 Пиши как сообщение в Telegram: короткие абзацы, пустая строка между блоками.
-Без заголовков-секций, без «Итого:» и «Сводка:».
+Без заголовков-секций. Максимум 5–7 строк на ответ. Если нужно больше — предложи развернуть.
 
 ВМЕСТО СПИСКОВ — ИТОГИ
-Не перечисляй задачи одну за другой. Сначала скажи главное:
-что сейчас в фокусе, что застряло, что можно закрыть сегодня.
-Детали — только если человек спросит.
+Сначала скажи главное: что в фокусе, что застряло, что закрыть сегодня. Детали — по запросу.
+Плохо: «- Задача 1 в работе / - Задача 2 в работе»
+Хорошо: «Из активного — 3 задачи, две по проекту X. Задача Y висит 5 дней без движения — стоит разобраться.»
 
-Плохо: «- Задача 1 в работе / - Задача 2 в работе / - Задача 3 ожидает»
-Хорошо: «Из активного — 3 задачи, две по проекту X. Задача Y висит уже 5 дней без движения — стоит разобраться.»
+ВОПРОСЫ О СТАТУСЕ
+Любой вопрос типа «что в работе», «статус», «что делаем», «покажи задачи» — отвечай по данным текущего спринта.
+Данные всегда есть в контексте. Никогда не говори «не знаю» или «нет данных».
 
+ЕСЛИ ВОПРОС НЕ ПО ТЕМЕ
+Одна фраза, без объяснений что умеешь / не умеешь.
+Примеры: «Это не по моей части.» / «Спроси что-нибудь по делу.» Можно с иронией.
+
+МЕНЕДЖЕРЫ И ОТВЕТСТВЕННЫЕ
+Колонка From — постановщик задачи = менеджер проекта = ответственный.
+Если спрашивают «кто менеджер», «кто ответственный», «с кем согласовывать» — смотри на From.
+Если в комментарии (Com) написано уточнить у конкретного человека — упомяни его @ником в ответе.
+{managers}
 ГРУППИРОВКА И АНАЛИЗ
-Сам группируй задачи по проектам, темам или статусам — не жди, пока спросят.
+Сам группируй задачи по проектам или статусам — не жди, пока спросят.
 Замечай паттерны: что накапливается, что давно не двигается, что срочно.
-Никогда не делай выводы о том, что конкретный человек перегружен или недозагружен — только общая картина по отделу.
+Никогда не делай выводов о том, что конкретный человек перегружен — только общая картина по отделу.
 
 УТОЧНЯЙ, ЕСЛИ НУЖНО
-Если запрос неоднозначный — задай один короткий вопрос, не несколько. Не додумывай молча.
-
-СТРУКТУРА ОТВЕТА (когда нужен обзор)
-1. Одна фраза — общий статус
-2. Что требует внимания прямо сейчас
-3. (Опционально) Что можно отложить или делегировать
-Максимум 5–7 строк. Если нужно больше — предложи развернуть конкретный раздел.
+Если запрос неоднозначный — один короткий вопрос, не несколько. Не додумывай молча.
 
 ДАННЫЕ
 Приоритеты: П1 ГОРИМ — сдать первым / П2 — обычный темп / П3 — не горит / Done — закрыто / cancel — неактуально
-Колонки: Task — задача, Lid/Lid#2 — ответственные, Priority — приоритет, From — постановщик, DD — дедлайн, Com — комментарии
+Колонки: Task — задача, Lid/Lid#2 — ответственные лиды, Priority — приоритет, From — постановщик/менеджер, DD — дедлайн, Com — комментарии
 Сравнивай дедлайны с сегодняшней датой ({today}) — называй что горит, что на подходе.
-Читай комментарии (Com) — там детали, всегда учитывай.
+Читай Com — там детали, всегда учитывай.
 
 Отвечай на языке пользователя.\
 """
@@ -111,7 +114,27 @@ EXTRACT_INBOX_PROMPT = """\
 {"task": "описание задачи", "from": "от кого или пустая строка"}
 """
 
+# ── Managers: name → Telegram @username ───────────────────
+# Заполни: {"Имя": "@username", ...}
+MANAGERS: dict[str, str] = {
+    # "Алёна": "@alena_tg",
+    # "Иван": "@ivan_tg",
+}
+
+EXTRACT_COMMENT_PROMPT = """\
+Пользователь хочет добавить или обновить комментарий к задаче в спринте.
+
+Верни ТОЛЬКО валидный JSON без markdown:
+{"task": "название задачи или проекта", "com": "текст комментария"}
+
+Если название задачи неясно — верни task как пустую строку.
+"""
+
 # ── Intent detection ──────────────────────────────────────
+UPDATE_COMMENT_RE = re.compile(
+    r"^(добавь комментарий|обнови комментарий|добавь ком к|обнови ком к|добавь заметку к)",
+    re.IGNORECASE
+)
 ADD_KEYWORDS = re.compile(
     r"^(добавь|добавить|создай|создать|запиши|новая задача|новый проект|внеси)",
     re.IGNORECASE
@@ -219,9 +242,20 @@ def fetch_sheet() -> str | None:
         return cached
 
 
-def build_system_prompt() -> str:
+def build_base_prompt() -> str:
+    """SYSTEM_PROMPT with today's date and managers list (no sprint data)."""
     today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
-    prompt = SYSTEM_PROMPT.format(today=today)
+    if MANAGERS:
+        lines = [f"- {name}: {tg}" for name, tg in MANAGERS.items()]
+        managers_str = "Telegram-ники менеджеров:\n" + "\n".join(lines) + "\n"
+    else:
+        managers_str = ""
+    return SYSTEM_PROMPT.format(today=today, managers=managers_str)
+
+
+def build_system_prompt() -> str:
+    """Full system prompt with sprint data appended (for Q&A)."""
+    prompt = build_base_prompt()
     data = fetch_sheet()
     if not data:
         return prompt
@@ -369,6 +403,48 @@ async def handle_add_sprint_task(update: Update, text: str) -> None:
         await update.message.reply_text("Не удалось записать в таблицу.")
 
 
+# ── Update comment flow ───────────────────────────────────
+
+async def handle_update_comment(update: Update, text: str) -> None:
+    """Extract project name + comment text, update Com field via Apps Script."""
+    if not APPS_SCRIPT_URL:
+        await update.message.reply_text("Обновление комментариев не настроено (нет APPS_SCRIPT_URL).")
+        return
+
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            system=EXTRACT_COMMENT_PROMPT,
+            messages=[{"role": "user", "content": text}],
+        )
+        raw = resp.content[0].text.strip()
+        raw = re.sub(r"^```json?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        data = json.loads(raw)
+    except Exception as e:
+        logger.error("Comment extract error: %s", e)
+        await update.message.reply_text("Не понял. Напиши: «Добавь комментарий к [проект]: [текст]»")
+        return
+
+    task_name = data.get("task", "").strip()
+    com = data.get("com", "").strip()
+
+    if not task_name:
+        await update.message.reply_text("Не понял, к какому проекту. Напиши: «Добавь комментарий к [проект]: [текст]»")
+        return
+    if not com:
+        await update.message.reply_text("Не нашёл текст комментария.")
+        return
+
+    ok = post_to_apps_script({"action": "update_comment", "task": task_name, "com": com})
+    if ok:
+        await update.message.reply_text(f"Комментарий к «{task_name}» обновлён ✅")
+        sheet_cache["updated_at"] = None
+    else:
+        await update.message.reply_text("Не удалось записать в таблицу.")
+
+
 # ── Handlers ──────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -430,11 +506,10 @@ async def sprint_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     try:
         today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
-        prompt = SYSTEM_PROMPT.format(today=today)
         resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=2048,
-            system=prompt,
+            system=build_base_prompt(),
             messages=[{
                 "role": "user",
                 "content": (
@@ -464,11 +539,10 @@ async def hot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
-        prompt = SYSTEM_PROMPT.format(today=today)
         resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=1024,
-            system=prompt,
+            system=build_base_prompt(),
             messages=[{
                 "role": "user",
                 "content": (
@@ -541,6 +615,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if state_info.get("state") == "awaiting_inbox_details":
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
         await handle_inbox_details(update, text)
+        return
+
+    # ── Update comment ──
+    if UPDATE_COMMENT_RE.match(text.strip()):
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        await handle_update_comment(update, text)
         return
 
     # ── Add to sprint ──
