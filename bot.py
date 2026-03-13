@@ -1,13 +1,19 @@
 import os
 import csv
 import io
+import json
 import logging
+import re
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
+from zoneinfo import ZoneInfo
 
 from anthropic import Anthropic
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    filters, ContextTypes,
+)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,17 +26,24 @@ logger = logging.getLogger(__name__)
 
 client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-# Per-user conversation history (in-memory)
+# ── State ────────────────────────────────────────────────
 user_conversations: dict[int, list] = {}
+# Multi-step state: {"state": "awaiting_inbox_details", "task": "...", "from": "..."}
+user_states: dict[int, dict] = {}
 
+# ── Config ────────────────────────────────────────────────
 SHEET_URL = os.environ.get(
     "SHEET_URL",
     "https://docs.google.com/spreadsheets/d/12PGjDfUKdpo0oCPJXWIJXigEC78cIchhd2ySyfzJkc4/export?format=csv&gid=469759902"
 )
-CACHE_TTL = 300  # 5 minutes
+APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "")
+TELEGRAM_GROUP_ID = os.environ.get("TELEGRAM_GROUP_ID", "")
 
+CACHE_TTL = 300
 sheet_cache: dict = {"data": None, "updated_at": None}
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
+# ── Prompts ───────────────────────────────────────────────
 SYSTEM_PROMPT = """\
 Ты траффик-менеджер креативного отдела. Свой человек в команде. Твоя задача — чтобы все видели картину: что в работе, что горит, что скоро сдавать.
 
@@ -43,21 +56,6 @@ SYSTEM_PROMPT = """\
 - Читай и учитывай комментарии (Com) — там реальные детали по задачам
 - В конце или начале ответа добавь короткую шутку или ироничный комментарий по ситуации (не натужный, а в тему)
 - Можешь использовать эмодзи, но без перебора
-
-Пример хорошего ответа:
-"Всего 12 задач на неделе, 2 из них П1 — горят прямо сейчас.
-
-П1 ГОРИМ:
-- ВФМ/Екатеринбург, дедлайн 13.03 — вот-вот
-- Визитор Центр, тоже 13.03
-
-П2 на подходе:
-- Презентация общая pitch, 13.03
-- Проекты от КИБ, 11.03 — кстати, это уже просрочено
-
-Из комментариев: по Формуле Цветка за пнд собираем Цветы третьяковка, по Спортивному треку брифинг на неделе.
-
-Ну что, кофе и вперёд? ☕"
 
 Приоритеты:
 - П1 ГОРИМ — самое срочное, сдать первым
@@ -80,22 +78,50 @@ SYSTEM_PROMPT = """\
 Отвечай на языке пользователя.\
 """
 
+EXTRACT_TASK_PROMPT = """\
+Пользователь хочет добавить задачу в спринт-таблицу. Извлеки данные из его сообщения.
+
+Верни ТОЛЬКО валидный JSON (без markdown, без ```), со следующими полями:
+- "task": название задачи/проекта (обязательно)
+- "priority": приоритет — "П1 ГОРИМ", "П2" или "П3" (по умолчанию "П2")
+- "dd": дедлайн в формате ДД.ММ.ГГГГ (если указан, иначе "")
+- "lid": ответственный лид (если указан, иначе "")
+- "lid2": второй лид (если указан, иначе "")
+- "from": от кого задача (если указано, иначе "")
+- "com": комментарий (если есть, иначе "")
+"""
+
+EXTRACT_INBOX_PROMPT = """\
+Пользователь передаёт входящую задачу. Извлеки из сообщения:
+1. Описание задачи (что нужно сделать)
+2. От кого задача (имя/ник, если упомянуто)
+
+Верни ТОЛЬКО валидный JSON без markdown:
+{"task": "описание задачи", "from": "от кого или пустая строка"}
+"""
+
+# ── Intent detection ──────────────────────────────────────
+ADD_KEYWORDS = re.compile(
+    r"^(добавь|добавить|создай|создать|запиши|новая задача|новый проект|внеси)",
+    re.IGNORECASE
+)
+INBOX_KEYWORDS = re.compile(
+    r"(входящ|задача от|есть задача|передай задачу|пришла задача)",
+    re.IGNORECASE
+)
+
+
+# ── Sheet parsing ─────────────────────────────────────────
 
 def parse_current_sprint(csv_text: str) -> tuple[str, str]:
-    """Parse CSV, find the LAST sprint section, return only those tasks.
-
-    Returns (sprint_name, formatted_text).
-    """
     reader = csv.reader(io.StringIO(csv_text))
     all_rows = list(reader)
 
     if len(all_rows) < 2:
         return "", ""
 
-    # First row = headers
     headers = [h.strip() for h in all_rows[0]]
 
-    # Find ALL "Запланированные задачи" rows — take the LAST one
     last_sprint_idx = 0
     sprint_name = "Текущий спринт"
 
@@ -106,16 +132,13 @@ def parse_current_sprint(csv_text: str) -> tuple[str, str]:
                 sprint_name = cell.strip()
                 break
 
-    # Take only rows AFTER the last sprint header
     task_rows = all_rows[last_sprint_idx + 1:]
 
-    # Build readable task list
     tasks = []
     for row in task_rows:
         if not any(cell.strip() for cell in row):
             continue
 
-        # Map header -> value
         t = {}
         for j, val in enumerate(row):
             if j < len(headers) and headers[j]:
@@ -125,10 +148,9 @@ def parse_current_sprint(csv_text: str) -> tuple[str, str]:
         if not name or "Запланированные задачи" in name:
             continue
 
-        # Build a clean readable block for each task
         num = t.get("№", t.get("#", ""))
         lines = []
-        prefix = f"{num}. " if num else "• "
+        prefix = f"{num}. " if num else "- "
         lines.append(f"{prefix}{name}")
 
         if t.get("Lid"):
@@ -155,7 +177,6 @@ def parse_current_sprint(csv_text: str) -> tuple[str, str]:
 
 
 def fetch_sheet() -> str | None:
-    """Fetch sprint sheet CSV, parse only current sprint, cache 5 min."""
     now = datetime.now()
     cached = sheet_cache["data"]
     updated = sheet_cache["updated_at"]
@@ -186,8 +207,7 @@ def fetch_sheet() -> str | None:
 
 
 def build_system_prompt() -> str:
-    """System prompt + today's date + current sprint data."""
-    today = datetime.now().strftime("%d.%m.%Y")
+    today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
     prompt = SYSTEM_PROMPT.format(today=today)
     data = fetch_sheet()
     if not data:
@@ -195,50 +215,252 @@ def build_system_prompt() -> str:
     return prompt + f"\n\n---\nДанные текущего спринта:\n\n{data}\n---"
 
 
+# ── Write to sheet via Apps Script ────────────────────────
+
+def post_to_apps_script(payload: dict) -> bool:
+    if not APPS_SCRIPT_URL:
+        return False
+    try:
+        resp = requests.post(APPS_SCRIPT_URL, json=payload, timeout=15)
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        logger.error("Apps Script error: %s", e)
+        return False
+
+
+# ── Incoming task flow ────────────────────────────────────
+
+async def handle_inbox_start(update: Update, text: str) -> None:
+    """Step 1: detect incoming task, extract basic info, ask for details."""
+    user_id = update.effective_user.id
+    sender_name = (
+        update.effective_user.full_name
+        or update.effective_user.username
+        or "Неизвестный"
+    )
+
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            system=EXTRACT_INBOX_PROMPT,
+            messages=[{"role": "user", "content": text}],
+        )
+        raw = resp.content[0].text.strip()
+        raw = re.sub(r"^```json?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        data = json.loads(raw)
+    except Exception as e:
+        logger.error("Inbox extract error: %s", e)
+        data = {"task": text, "from": ""}
+
+    task = data.get("task", text).strip()
+    from_person = data.get("from", "").strip() or sender_name
+
+    user_states[user_id] = {
+        "state": "awaiting_inbox_details",
+        "task": task,
+        "from": from_person,
+    }
+
+    await update.message.reply_text(
+        f"Записываю задачу: {task}\n"
+        f"От кого: {from_person}\n\n"
+        "Есть дополнительные детали, вводные или требования? "
+        "(размеры, сроки, форматы, ссылки...)\n"
+        "Если нет — просто напиши: нет"
+    )
+
+
+async def handle_inbox_details(update: Update, text: str) -> None:
+    """Step 2: receive details, save to Входящие sheet."""
+    user_id = update.effective_user.id
+    state = user_states.pop(user_id, {})
+
+    task = state.get("task", "")
+    from_person = state.get("from", "")
+
+    no_details = re.match(r"^(нет|no|ок|ok|всё|все|пропустить|без деталей)[.,!?]?$",
+                          text.strip(), re.IGNORECASE)
+    com = "" if no_details else text.strip()
+
+    today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
+    saved = post_to_apps_script({
+        "sheet": "Входящие",
+        "task": task,
+        "com": com,
+        "from": from_person,
+        "date": today,
+    })
+
+    if saved:
+        reply = f"Записал во Входящие:\nЗадача: {task}"
+        if com:
+            reply += f"\nДетали: {com}"
+        reply += f"\nОт: {from_person}\n\nВсё зафиксировано в таблице ✅"
+    else:
+        reply = (
+            f"Задача '{task}' принята, но сохранить в таблицу не получилось "
+            "(APPS_SCRIPT_URL не настроен). Обратись к администратору."
+        )
+
+    await update.message.reply_text(reply)
+
+
+# ── Sprint add flow ───────────────────────────────────────
+
+async def handle_add_sprint_task(update: Update, text: str) -> None:
+    if not APPS_SCRIPT_URL:
+        await update.message.reply_text(
+            "Добавление в спринт не настроено (нет APPS_SCRIPT_URL)."
+        )
+        return
+
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            system=EXTRACT_TASK_PROMPT,
+            messages=[{"role": "user", "content": text}],
+        )
+        raw = resp.content[0].text.strip()
+        raw = re.sub(r"^```json?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        task_data = json.loads(raw)
+    except Exception as e:
+        logger.error("Task extraction error: %s", e)
+        await update.message.reply_text(
+            "Не понял задачу. Попробуй: Добавь Название проекта, П1, дедлайн 20 марта"
+        )
+        return
+
+    task_name = task_data.get("task", "").strip()
+    if not task_name:
+        await update.message.reply_text("Не нашёл название задачи. Попробуй ещё раз.")
+        return
+
+    task_data["sheet"] = "sprint"
+    ok = post_to_apps_script(task_data)
+
+    if ok:
+        priority = task_data.get("priority", "П2")
+        dd = task_data.get("dd", "")
+        confirm = f"Добавил в спринт: {task_name} ({priority})"
+        if dd:
+            confirm += f", дедлайн {dd}"
+        confirm += " ✅"
+        await update.message.reply_text(confirm)
+        sheet_cache["updated_at"] = None  # invalidate cache
+    else:
+        await update.message.reply_text("Не удалось записать в таблицу.")
+
+
+# ── Morning digest job ─────────────────────────────────────
+
+async def morning_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Daily 10:00 Moscow digest to the group."""
+    if not TELEGRAM_GROUP_ID:
+        logger.info("Morning digest skipped: TELEGRAM_GROUP_ID not set")
+        return
+
+    data = fetch_sheet()
+    if not data:
+        logger.warning("Morning digest: no sheet data")
+        return
+
+    today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
+    prompt = SYSTEM_PROMPT.format(today=today)
+
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            system=prompt,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Данные спринта:\n\n{data}\n\n"
+                    f"Сегодня {today}. Утренняя сводка для команды:\n"
+                    "- Что горит сегодня (П1)\n"
+                    "- Что планируем сдать сегодня (дедлайн сегодня или вчера)\n"
+                    "- Что сделали (Done)\n"
+                    "- Общая картина дня\n"
+                    "Пиши бодро и кратко. Без звёздочек, без markdown."
+                )
+            }]
+        )
+        text = resp.content[0].text
+        await context.bot.send_message(chat_id=int(TELEGRAM_GROUP_ID), text=text)
+        logger.info("Morning digest sent to group %s", TELEGRAM_GROUP_ID)
+    except Exception as e:
+        logger.error("Morning digest error: %s", e)
+
+
 # ── Handlers ──────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Привет! 👋 Я ассистент креативного отдела.\n\n"
-        "Спрашивай про текущий спринт:\n"
-        "• По каким проектам горим?\n"
-        "• Какие задачи сдаём на этой неделе?\n"
-        "• Кто чем занят?\n\n"
+        "Привет! Я траффик-менеджер креативного отдела.\n\n"
+        "Что умею:\n"
+        "- Отвечать на вопросы про спринт\n"
+        "- Входящие задачи: 'Задача от Ани — нужен баннер'\n"
+        "- Добавить в спринт: 'Добавь Новый проект, П1'\n\n"
         "/report — сводка по спринту\n"
-        "/clear — начать заново"
+        "/clear — начать заново\n"
+        "/setgroup — зарегистрировать эту группу для утреннего дайджеста"
     )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Просто пиши вопросы про спринт — я вижу актуальные задачи.\n\n"
+        "Команды:\n"
+        "/report — сводка по спринту\n"
+        "/clear — очистить историю\n"
+        "/setgroup — зарегистрировать группу для утреннего дайджеста\n\n"
         "Примеры:\n"
-        "• Что горит?\n"
-        "• Что сдаём завтра?\n"
-        "• Что делает Миша?\n\n"
-        "/report — полная сводка\n"
-        "/clear — очистить историю"
+        "- Что горит?\n"
+        "- Что сдаём завтра?\n"
+        "- Задача от Алены — нужен ролик для Сбера\n"
+        "- Добавь Новый проект, П2, дедлайн 25 марта\n\n"
+        "В группе: тегни @бота или напиши 'Агент, ...' чтобы я ответил."
     )
 
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_conversations.pop(update.effective_user.id, None)
+    uid = update.effective_user.id
+    user_conversations.pop(uid, None)
+    user_states.pop(uid, None)
     await update.message.reply_text("Готово, начнём заново ✨")
 
 
+async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run this command in a group to register it for morning digest."""
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text(
+            "Эту команду нужно запустить прямо в группе, куда слать утреннюю сводку."
+        )
+        return
+    await update.message.reply_text(
+        f"ID этой группы: {chat.id}\n\n"
+        f"Добавь в Railway переменную:\n"
+        f"TELEGRAM_GROUP_ID = {chat.id}"
+    )
+
+
 async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Generate a sprint summary."""
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     data = fetch_sheet()
     if not data:
-        await update.message.reply_text("Не удалось загрузить таблицу 😕")
+        await update.message.reply_text("Не удалось загрузить таблицу.")
         return
 
     try:
-        today = datetime.now().strftime("%d.%m.%Y")
+        today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
         prompt = SYSTEM_PROMPT.format(today=today)
-        response = client.messages.create(
+        resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=2048,
             system=prompt,
@@ -246,27 +468,66 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "role": "user",
                 "content": (
                     f"Данные спринта:\n\n{data}\n\n"
-                    f"Сегодня {today}. Дай сводку как траффик-менеджер:\n"
-                    "- Сколько задач в работе, сколько горит (П1)\n"
-                    "- Перечисли П1 с дедлайнами\n"
-                    "- Что из П2 на подходе по дедлайнам\n"
-                    "- Есть ли просроченные (дедлайн раньше сегодня)\n"
+                    f"Сегодня {today}. Сводка как траффик-менеджер:\n"
+                    "- Сколько задач в работе, сколько горит\n"
+                    "- П1 с дедлайнами\n"
+                    "- П2 на подходе\n"
+                    "- Просроченные\n"
                     "- Что важного в комментариях\n"
-                    "Без звёздочек, без markdown. Чистый текст. И шутку в конце."
+                    "Без звёздочек, без markdown. Чистый текст. Шутку в конце."
                 )
             }]
         )
-        await _send_long_message(update, response.content[0].text)
+        await _send(update, resp.content[0].text)
     except Exception as e:
         logger.error("Report error: %s", e)
-        await update.message.reply_text("Ошибка при генерации отчёта 🔄")
+        await update.message.reply_text("Ошибка при генерации отчёта.")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle free-text messages."""
-    user_id = update.effective_user.id
-    text = update.message.text
+    if not update.message or not update.message.text:
+        return
 
+    text = update.message.text
+    user_id = update.effective_user.id
+    chat_type = update.message.chat.type
+    is_group = chat_type in ("group", "supergroup")
+
+    # ── Group: only respond when mentioned or called "Агент" ──
+    if is_group:
+        bot_username = (await context.bot.get_me()).username
+        mentioned = (
+            f"@{bot_username}".lower() in text.lower()
+            or re.search(r"\bагент\b", text, re.IGNORECASE)
+        )
+        if not mentioned:
+            return
+        # Strip mention from text before processing
+        text = re.sub(rf"@{re.escape(bot_username)}", "", text, flags=re.IGNORECASE).strip()
+        text = re.sub(r"\bагент[,!?.]?\s*", "", text, flags=re.IGNORECASE).strip()
+        if not text:
+            text = "Что в работе сегодня?"
+
+    # ── Multi-step state: user is providing inbox task details ──
+    state_info = user_states.get(user_id, {})
+    if state_info.get("state") == "awaiting_inbox_details":
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        await handle_inbox_details(update, text)
+        return
+
+    # ── Add to sprint ──
+    if ADD_KEYWORDS.match(text.strip()):
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        await handle_add_sprint_task(update, text)
+        return
+
+    # ── Incoming task ──
+    if INBOX_KEYWORDS.search(text):
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        await handle_inbox_start(update, text)
+        return
+
+    # ── Normal Q&A ──
     if user_id not in user_conversations:
         user_conversations[user_id] = []
 
@@ -276,24 +537,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
-        response = client.messages.create(
+        resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=1024,
             system=build_system_prompt(),
             messages=messages,
         )
-        reply = response.content[0].text
+        reply = resp.content[0].text
     except Exception as e:
         logger.error("API error: %s", e)
-        await update.message.reply_text("Ошибка AI, попробуй ещё раз 😕")
+        await update.message.reply_text("Ошибка AI, попробуй ещё раз.")
         return
 
     user_conversations[user_id].append({"role": "assistant", "content": reply})
-    await _send_long_message(update, reply)
+    await _send(update, reply)
 
 
-async def _send_long_message(update: Update, text: str) -> None:
-    """Split message if it exceeds Telegram's 4096-char limit."""
+async def _send(update: Update, text: str) -> None:
     if len(text) <= 4096:
         await update.message.reply_text(text)
     else:
@@ -307,13 +567,26 @@ def main() -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     app = Application.builder().token(token).build()
 
+    # Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("report", report))
+    app.add_handler(CommandHandler("setgroup", setgroup))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Bot started — sprint tracker")
+    # Morning digest: every day at 10:00 Moscow time
+    if app.job_queue:
+        app.job_queue.run_daily(
+            morning_digest,
+            time=dtime(10, 0, tzinfo=MOSCOW_TZ),
+            name="morning_digest",
+        )
+        logger.info("Morning digest scheduled at 10:00 Moscow time")
+    else:
+        logger.warning("Job queue not available — morning digest disabled")
+
+    logger.info("Bot started")
     app.run_polling(drop_pending_updates=True)
 
 
