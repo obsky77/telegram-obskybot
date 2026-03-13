@@ -306,6 +306,19 @@ def post_to_apps_script(payload: dict) -> bool:
         return False
 
 
+def query_apps_script(payload: dict) -> str | None:
+    """Post to Apps Script and return the raw response text (or None on error)."""
+    if not APPS_SCRIPT_URL:
+        return None
+    try:
+        resp = requests.post(APPS_SCRIPT_URL, json=payload, timeout=15)
+        resp.raise_for_status()
+        return resp.text.strip()
+    except Exception as e:
+        logger.error("Apps Script error: %s", e)
+        return None
+
+
 # ── Incoming task flow ────────────────────────────────────
 
 async def handle_inbox_start(update: Update, text: str) -> None:
@@ -467,12 +480,20 @@ async def handle_update_comment(update: Update, text: str) -> None:
         await update.message.reply_text("Не нашёл текст комментария.")
         return
 
-    ok = post_to_apps_script({"action": "update_comment", "task": task_name, "com": com})
-    if ok:
+    result = query_apps_script({"action": "update_comment", "task": task_name, "com": com})
+    if result is None:
+        await update.message.reply_text("Не удалось связаться с таблицей.")
+    elif result == "OK":
         await update.message.reply_text(f"Комментарий к «{task_name}» обновлён ✅")
         sheet_cache["updated_at"] = None
+    elif "NOT FOUND" in result:
+        await update.message.reply_text(
+            f"Не нашёл задачу «{task_name}» в текущем спринте. Уточни название."
+        )
     else:
-        await update.message.reply_text("Не удалось записать в таблицу.")
+        logger.warning("Apps Script unexpected response: %s", result)
+        await update.message.reply_text(f"Комментарий к «{task_name}» обновлён ✅")
+        sheet_cache["updated_at"] = None
 
 
 # ── Handlers ──────────────────────────────────────────────
