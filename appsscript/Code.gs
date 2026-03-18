@@ -75,8 +75,7 @@ function updateComment(payload) {
     var cellValue = String(data[row][taskCol]).toLowerCase().trim();
     if (!cellValue) continue;
 
-    // Partial match в обе стороны — «ПМФ» найдёт «ПМФ по ролику»
-    if (cellValue.indexOf(searchName) !== -1 || searchName.indexOf(cellValue) !== -1) {
+    if (isTaskMatch(cellValue, searchName)) {
       var existing = String(data[row][comCol]).trim();
       var newCom = existing ? existing + " | " + payload.com : payload.com;
       sheet.getRange(row + 1, comCol + 1).setValue(newCom);
@@ -118,7 +117,7 @@ function updateField(payload) {
   for (var row = sprintStart; row < data.length; row++) {
     var cellValue = String(data[row][taskCol]).toLowerCase().trim();
     if (!cellValue) continue;
-    if (cellValue.indexOf(searchName) !== -1 || searchName.indexOf(cellValue) !== -1) {
+    if (isTaskMatch(cellValue, searchName)) {
       sheet.getRange(row + 1, fieldCol + 1).setValue(payload.value || "");
       return jsonResponse("ok", "Updated " + payload.field + " for: " + data[row][taskCol]);
     }
@@ -249,9 +248,8 @@ function searchDrive(payload) {
     var folderName      = folder.getName();
     var folderNameLower = folderName.toLowerCase();
 
-    // Bidirectional partial match, case-insensitive
-    var isMatch = (folderNameLower.indexOf(queryLower) !== -1)
-               || (queryLower.indexOf(folderNameLower) !== -1);
+    // Bidirectional substring or token overlap (handles "Тося Чайкина" ↔ "Тося чайника/самокат")
+    var isMatch = isTaskMatch(folderNameLower, queryLower);
     if (!isMatch) continue;
 
     var filesResult = [];
@@ -286,6 +284,35 @@ function driveJsonResponse(status, message) {
 }
 
 // ── Helpers ────────────────────────────────────────────────
+
+/**
+ * Token-based overlap match.
+ * Splits both strings into words (≥3 chars), returns true if any word
+ * from 'a' is a substring of any word from 'b', or vice versa.
+ * Handles cases like "Тося Чайкина" ↔ "Тося чайника/самокат".
+ */
+function tokensOverlap(a, b) {
+  function tokenize(s) {
+    return s.toLowerCase().split(/[\s\/\-_.,;:!?()]+/).filter(function(t) { return t.length >= 3; });
+  }
+  var aT = tokenize(a);
+  var bT = tokenize(b);
+  for (var i = 0; i < aT.length; i++) {
+    for (var j = 0; j < bT.length; j++) {
+      if (bT[j].indexOf(aT[i]) !== -1 || aT[i].indexOf(bT[j]) !== -1) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function isTaskMatch(cellValue, searchName) {
+  // Primary: bidirectional substring
+  if (cellValue.indexOf(searchName) !== -1 || searchName.indexOf(cellValue) !== -1) return true;
+  // Fallback: token overlap (handles typos, different word forms, slash-separated names)
+  return tokensOverlap(cellValue, searchName);
+}
 
 function getSprintSheet() {
   var ss     = SpreadsheetApp.openById(SPREADSHEET_ID);
