@@ -1204,24 +1204,6 @@ async def _generate_morning_digest() -> str:
         return ""
 
 
-async def morning_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Daily 10:00 Moscow job — sends morning digest to the group."""
-    if not TELEGRAM_GROUP_ID:
-        logger.warning("TELEGRAM_GROUP_ID not set, skipping morning digest")
-        return
-
-    text = await _generate_morning_digest()
-    if not text:
-        logger.warning("Empty morning digest, skipping send")
-        return
-
-    try:
-        await context.bot.send_message(chat_id=int(TELEGRAM_GROUP_ID), text=text)
-        logger.info("Morning digest sent to group %s", TELEGRAM_GROUP_ID)
-    except Exception as e:
-        logger.error("Morning digest send error: %s", e)
-
-
 # ── Handlers ──────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1267,7 +1249,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Верну ссылку на папку и список всех файлов внутри.\n"
         "\n"
         "ДАЙДЖЕСТ И ИНСАЙТЫ\n"
-        "/digest — сводка по спринту прямо сейчас (автоматически приходит в группу в 10:00)\n"
+        "/digest — сводка по спринту прямо сейчас\n"
         "/insight — инсайт или приём от кого-то из 50 творцов и рекламщиков\n"
         "\n"
         "КАК ОБЩАТЬСЯ\n"
@@ -1298,12 +1280,6 @@ async def digest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Не удалось сформировать сводку — нет данных из таблицы.")
         return
     await _send(update, text)
-    # Also post to group if called from a different chat
-    if TELEGRAM_GROUP_ID and str(update.effective_chat.id) != TELEGRAM_GROUP_ID:
-        try:
-            await context.bot.send_message(chat_id=int(TELEGRAM_GROUP_ID), text=text)
-        except Exception as e:
-            logger.error("digest_cmd group send error: %s", e)
 
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1549,18 +1525,10 @@ async def _send(update: Update, text: str) -> None:
 # ── Main ──────────────────────────────────────────────────
 
 async def post_init(app: Application) -> None:
-    """Cache bot username and schedule morning digest at 10:00 Moscow."""
+    """Cache bot username on startup."""
     me = await app.bot.get_me()
     app.bot_data["username"] = me.username.lower()
     logger.info("Bot username cached: @%s", me.username)
-
-    if app.job_queue:
-        app.job_queue.run_daily(
-            morning_digest_job,
-            time=dtime(10, 0, 0, tzinfo=MOSCOW_TZ),
-            name="morning_digest",
-        )
-        logger.info("Morning digest job scheduled at 10:00 Moscow")
 
 
 def main() -> None:
