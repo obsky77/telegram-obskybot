@@ -71,14 +71,40 @@ function updateComment(payload) {
     }
   }
 
+  var sender = payload.sender || "";
+  var newPart = payload.com + (sender ? " (" + sender + ")" : "");
+
   for (var row = sprintStart; row < data.length; row++) {
     var cellValue = String(data[row][taskCol]).toLowerCase().trim();
     if (!cellValue) continue;
 
     if (isTaskMatch(cellValue, searchName)) {
+      var cell = sheet.getRange(row + 1, comCol + 1);
       var existing = String(data[row][comCol]).trim();
-      var newCom = existing ? existing + " | " + payload.com : payload.com;
-      sheet.getRange(row + 1, comCol + 1).setValue(newCom);
+
+      var highlightStyle = SpreadsheetApp.newTextStyle()
+          .setForegroundColor("#1a73e8")  // синий цвет
+          .setBold(true)
+          .build();
+
+      if (!existing) {
+        // Пустая ячейка — просто пишем новый комментарий с подсветкой
+        var rt = SpreadsheetApp.newRichTextValue()
+          .setText(newPart)
+          .setTextStyle(0, newPart.length, highlightStyle)
+          .build();
+        cell.setRichTextValue(rt);
+      } else {
+        // Есть текст — добавляем через " | " с подсветкой нового
+        var fullText = existing + " | " + newPart;
+        var newStart = existing.length + 3; // после " | "
+        var rt = SpreadsheetApp.newRichTextValue()
+          .setText(fullText)
+          .setTextStyle(newStart, fullText.length, highlightStyle)
+          .build();
+        cell.setRichTextValue(rt);
+      }
+
       return jsonResponse("ok", "Updated: " + data[row][taskCol]);
     }
   }

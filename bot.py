@@ -651,14 +651,21 @@ def post_to_apps_script(payload: dict) -> bool:
         return False
 
 
-def query_apps_script(payload: dict) -> str | None:
-    """Post to Apps Script and return the raw response text (or None on error)."""
+def query_apps_script(payload: dict) -> dict | None:
+    """Post to Apps Script and return parsed JSON dict (or None on error)."""
     if not APPS_SCRIPT_URL:
         return None
     try:
         resp = requests.post(APPS_SCRIPT_URL, json=payload, timeout=15)
         resp.raise_for_status()
-        return resp.text.strip()
+        try:
+            return resp.json()
+        except ValueError:
+            # Fallback: если ответ не JSON, оборачиваем в dict
+            text = resp.text.strip()
+            if text == "OK":
+                return {"status": "ok", "message": text}
+            return {"status": "error", "message": text}
     except Exception as e:
         logger.error("Apps Script error: %s", e)
         return None
@@ -825,20 +832,27 @@ async def handle_update_comment(update: Update, text: str) -> None:
         await update.message.reply_text("Не нашёл текст комментария.")
         return
 
-    result = query_apps_script({"action": "update_comment", "task": task_name, "com": com})
+    # Определяем ник отправителя
+    sender = update.effective_user
+    sender_tag = "@" + sender.username if sender.username else sender.full_name or "Аноним"
+
+    result = query_apps_script({
+        "action": "update_comment",
+        "task": task_name,
+        "com": com,
+        "sender": sender_tag,
+    })
     if result is None:
         await update.message.reply_text("Не удалось связаться с таблицей.")
-    elif result == "OK":
+    elif result.get("status") == "ok":
         await update.message.reply_text(f"Комментарий к «{task_name}» обновлён ✅")
         sheet_cache["updated_at"] = None
-    elif "NOT FOUND" in result:
+    else:
+        msg = result.get("message", "")
+        logger.warning("Apps Script comment error: %s", msg)
         await update.message.reply_text(
             f"Не нашёл задачу «{task_name}» в текущем спринте. Уточни название."
         )
-    else:
-        logger.warning("Apps Script unexpected response: %s", result)
-        await update.message.reply_text(f"Комментарий к «{task_name}» обновлён ✅")
-        sheet_cache["updated_at"] = None
 
 
 # ── Update field (deadline / priority) ───────────────────
@@ -887,16 +901,15 @@ async def handle_update_field(update: Update, text: str) -> None:
     field_ru = "дедлайн" if field == "DD" else "приоритет"
     if result is None:
         await update.message.reply_text("Не удалось связаться с таблицей.")
-    elif '"status":"ok"' in (result or "") or '"status": "ok"' in (result or ""):
+    elif result.get("status") == "ok":
         await update.message.reply_text(f"Обновил {field_ru} для «{task_name}»: {value} ✅")
         sheet_cache["updated_at"] = None
-    elif "not found" in (result or "").lower() or "error" in (result or "").lower():
+    else:
+        msg = result.get("message", "")
+        logger.warning("Apps Script field error: %s", msg)
         await update.message.reply_text(
             f"Не нашёл задачу «{task_name}» в текущем спринте. Уточни название."
         )
-    else:
-        await update.message.reply_text(f"Обновил {field_ru} для «{task_name}»: {value} ✅")
-        sheet_cache["updated_at"] = None
 
 
 # ── Ask manager (tag & question) ─────────────────────────
@@ -1121,17 +1134,9 @@ async def handle_find_file(update: Update, text: str) -> None:
         return
 
     # Step 2: Call Apps Script
-    raw_result = query_apps_script({"action": "search_drive", "query": query})
-    if raw_result is None:
+    result = query_apps_script({"action": "search_drive", "query": query})
+    if result is None:
         await update.message.reply_text("Не удалось связаться с Google Drive.")
-        return
-
-    # Step 3: Parse response
-    try:
-        result = json.loads(raw_result)
-    except Exception as e:
-        logger.error("Drive search JSON parse: %s | raw: %s", e, raw_result)
-        await update.message.reply_text("Странный ответ от Drive, попробуй ещё раз.")
         return
 
     status = result.get("status", "")
