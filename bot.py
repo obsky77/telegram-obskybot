@@ -1410,7 +1410,7 @@ async def call_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _forward_call_link(update: Update, context: ContextTypes.DEFAULT_TYPE, link: str) -> None:
-    """Send /call <link> to the recorder bot group."""
+    """Send meeting link to the recorder bot group, tagging @Ogentcallbot."""
     if not CALL_GROUP_ID:
         await update.message.reply_text(
             "Не настроена группа для записи звонков.\n"
@@ -1420,7 +1420,7 @@ async def _forward_call_link(update: Update, context: ContextTypes.DEFAULT_TYPE,
     try:
         await context.bot.send_message(
             chat_id=int(CALL_GROUP_ID),
-            text=f"/call {link}",
+            text=f"@Ogentcallbot {link}",
         )
         await update.message.reply_text(f"Передал ссылку на запись: {link}")
     except Exception as e:
