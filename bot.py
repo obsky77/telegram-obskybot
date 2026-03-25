@@ -40,6 +40,7 @@ APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "")
 TELEGRAM_GROUP_ID = os.environ.get("TELEGRAM_GROUP_ID", "")
 CALL_GROUP_ID = os.environ.get("CALL_GROUP_ID", "")
 OGENT_BOT_TOKEN = os.environ.get("OGENT_BOT_TOKEN", "")
+RELAY_CHANNEL_ID = os.environ.get("RELAY_CHANNEL_ID", "")
 
 CACHE_TTL = 300
 sheet_cache: dict = {"data": None, "updated_at": None}
@@ -1380,6 +1381,23 @@ async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def setrelay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run in a channel to register it as the relay for Ogentcallbot."""
+    global RELAY_CHANNEL_ID
+    chat = update.effective_chat
+    if chat.type != "channel":
+        await update.message.reply_text(
+            "Эту команду нужно запустить в канале, где оба бота — админы."
+        )
+        return
+    RELAY_CHANNEL_ID = str(chat.id)
+    await update.message.reply_text(
+        f"Канал-мост установлен: {chat.id}\n\n"
+        f"Чтобы сохранить между перезапусками, добавь в Railway:\n"
+        f"RELAY_CHANNEL_ID = {chat.id}"
+    )
+
+
 async def setcallgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Run this command in a group to register it as the call-forwarding target."""
     global CALL_GROUP_ID
@@ -1411,22 +1429,24 @@ async def call_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _forward_call_link(update: Update, context: ContextTypes.DEFAULT_TYPE, link: str) -> None:
-    """Send meeting link from Ogentcallbot's identity so it picks it up via polling."""
-    if not OGENT_BOT_TOKEN:
+    """Post meeting link to the relay channel so Ogentcallbot picks it up."""
+    if not RELAY_CHANNEL_ID:
         await update.message.reply_text(
-            "OGENT_BOT_TOKEN не настроен.\n"
-            "Добавь токен Ogentcallbot в переменные окружения."
+            "Канал-мост не настроен.\n"
+            "Админ должен выполнить /setrelay в нужном канале."
         )
         return
 
-    chat_id = update.effective_chat.id
+    caller_chat_id = update.effective_chat.id
     try:
-        ogent_bot = Bot(token=OGENT_BOT_TOKEN)
-        await ogent_bot.send_message(chat_id=chat_id, text=link)
-        await update.message.reply_text(f"Передал ссылку Ogent — подключается к записи.")
+        await context.bot.send_message(
+            chat_id=int(RELAY_CHANNEL_ID),
+            text=f"{link} chat:{caller_chat_id}",
+        )
+        await update.message.reply_text("Передал ссылку Ogent — подключается к записи.")
     except Exception as e:
-        logger.error("Failed to forward call link via Ogent token: %s", e)
-        await update.message.reply_text("Не получилось передать ссылку Ogent. Проверь токен.")
+        logger.error("Failed to forward call link to relay channel: %s", e)
+        await update.message.reply_text("Не получилось переслать ссылку. Проверь настройки канала.")
 
 
 def _extract_meeting_link(text: str) -> str | None:
@@ -1697,6 +1717,7 @@ def main() -> None:
     app.add_handler(CommandHandler("report", report))    # alias → sprint
     app.add_handler(CommandHandler("fire", hot_cmd))     # alias → hot
     app.add_handler(CommandHandler("setgroup", setgroup))
+    app.add_handler(CommandHandler("setrelay", setrelay))
     app.add_handler(CommandHandler("setcallgroup", setcallgroup))
     app.add_handler(CommandHandler("call", call_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
