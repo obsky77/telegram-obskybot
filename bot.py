@@ -1434,31 +1434,29 @@ async def call_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _forward_call_link(update: Update, context: ContextTypes.DEFAULT_TYPE, link: str) -> None:
     """
-    Send meeting link to Ogentcallbot via HTTP API.
-    Ogentcallbot will join the meeting and send results to the same chat.
+    Post meeting link to the relay channel.
+    Format: "link|chat_id" — Ogentcallbot reads channel posts and starts recording.
+    Results are sent to chat_id (the chat where user sent /call).
     """
-    import requests as _req
-
-    ogent_url = os.environ.get("OGENT_API_URL", "http://127.0.0.1:8080")
-    source_chat_id = update.effective_chat.id
-
-    try:
-        resp = _req.post(
-            f"{ogent_url}/record",
-            json={"url": link, "chat_id": source_chat_id},
-            timeout=10,
+    relay_id = os.environ.get("RELAY_CHANNEL_ID", "") or CALL_GROUP_ID
+    if not relay_id:
+        await update.message.reply_text(
+            "Канал-мост не настроен.\n"
+            "Админ: /setcallgroup в канале где оба бота — админы."
         )
-        if resp.ok:
-            data = resp.json()
-            await update.message.reply_text(f"🔴 Ogent подключается к {data.get('platform', 'встрече')}...")
-        else:
-            error = resp.json().get("error", "Unknown error")
-            await update.message.reply_text(f"⚠️ {error}")
-    except _req.ConnectionError:
-        await update.message.reply_text("❌ Ogent бот не запущен.")
+        return
+
+    source_chat_id = update.effective_chat.id
+    try:
+        # Post to channel: "link|chat_id" format
+        await context.bot.send_message(
+            chat_id=int(relay_id),
+            text=f"{link}|{source_chat_id}",
+        )
+        await update.message.reply_text("🔴 Передал Ogent — подключается к записи...")
     except Exception as e:
-        logger.error("Failed to call Ogent API: %s", e)
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+        logger.error("Failed to forward call link: %s", e)
+        await update.message.reply_text(f"❌ Не удалось переслать: {e}")
 
 
 def _extract_meeting_link(text: str) -> str | None:
