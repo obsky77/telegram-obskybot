@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 from anthropic import Anthropic
-from telegram import Update
+from telegram import Bot, Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes,
@@ -39,6 +39,7 @@ SHEET_URL = os.environ.get(
 APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "")
 TELEGRAM_GROUP_ID = os.environ.get("TELEGRAM_GROUP_ID", "")
 CALL_GROUP_ID = os.environ.get("CALL_GROUP_ID", "")
+OGENT_BOT_TOKEN = os.environ.get("OGENT_BOT_TOKEN", "")
 
 CACHE_TTL = 300
 sheet_cache: dict = {"data": None, "updated_at": None}
@@ -1410,22 +1411,22 @@ async def call_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _forward_call_link(update: Update, context: ContextTypes.DEFAULT_TYPE, link: str) -> None:
-    """Send meeting link to the recorder bot group, tagging @Ogentcallbot."""
-    if not CALL_GROUP_ID:
+    """Send meeting link from Ogentcallbot's identity so it picks it up via polling."""
+    if not OGENT_BOT_TOKEN:
         await update.message.reply_text(
-            "Не настроена группа для записи звонков.\n"
-            "Админ должен выполнить /setcallgroup в нужной группе."
+            "OGENT_BOT_TOKEN не настроен.\n"
+            "Добавь токен Ogentcallbot в переменные окружения."
         )
         return
+
+    chat_id = update.effective_chat.id
     try:
-        await context.bot.send_message(
-            chat_id=int(CALL_GROUP_ID),
-            text=f"@Ogentcallbot {link}",
-        )
-        await update.message.reply_text(f"Передал ссылку на запись: {link}")
+        ogent_bot = Bot(token=OGENT_BOT_TOKEN)
+        await ogent_bot.send_message(chat_id=chat_id, text=link)
+        await update.message.reply_text(f"Передал ссылку Ogent — подключается к записи.")
     except Exception as e:
-        logger.error("Failed to forward call link: %s", e)
-        await update.message.reply_text("Не получилось переслать ссылку. Проверь настройки группы.")
+        logger.error("Failed to forward call link via Ogent token: %s", e)
+        await update.message.reply_text("Не получилось передать ссылку Ogent. Проверь токен.")
 
 
 def _extract_meeting_link(text: str) -> str | None:
