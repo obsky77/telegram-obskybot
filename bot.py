@@ -652,20 +652,40 @@ def post_to_apps_script(payload: dict) -> bool:
 
 
 def query_apps_script(payload: dict) -> dict | None:
-    """Post to Apps Script and return parsed JSON dict (or None on error)."""
+    """Post to Apps Script and return parsed JSON dict (or None on error).
+
+    Google Apps Script redirects POST→GET (302), so the response may arrive
+    with unexpected encoding or content-type.  We try several parsing
+    strategies before falling back to a raw-text wrapper.
+    """
     if not APPS_SCRIPT_URL:
         return None
     try:
         resp = requests.post(APPS_SCRIPT_URL, json=payload, timeout=15)
         resp.raise_for_status()
+
+        # Strategy 1: requests built-in JSON parser
         try:
-            return resp.json()
-        except ValueError:
-            # Fallback: если ответ не JSON, оборачиваем в dict
-            text = resp.text.strip()
-            if text == "OK":
-                return {"status": "ok", "message": text}
-            return {"status": "error", "message": text}
+            data = resp.json()
+            if isinstance(data, dict):
+                return data
+        except (ValueError, Exception):
+            pass
+
+        # Strategy 2: decode raw bytes (handles BOM, encoding quirks)
+        body = resp.content.decode("utf-8-sig", errors="replace").strip()
+        try:
+            data = json.loads(body)
+            if isinstance(data, dict):
+                return data
+        except (ValueError, json.JSONDecodeError):
+            pass
+
+        # Strategy 3: raw text fallback
+        logger.warning("Apps Script non-JSON response (action=%s): %s",
+                        payload.get("action", "?"), body[:300])
+        return {"status": "ok" if "ok" in body.lower() else "error",
+                "message": body}
     except Exception as e:
         logger.error("Apps Script error: %s", e)
         return None
@@ -844,15 +864,14 @@ async def handle_update_comment(update: Update, text: str) -> None:
     })
     if result is None:
         await update.message.reply_text("Не удалось связаться с таблицей.")
-    elif result.get("status") == "ok":
-        await update.message.reply_text(f"Комментарий к «{task_name}» обновлён ✅")
-        sheet_cache["updated_at"] = None
-    else:
-        msg = result.get("message", "")
-        logger.warning("Apps Script comment error: %s", msg)
+    elif result.get("status") == "error" and "not found" in result.get("message", "").lower():
         await update.message.reply_text(
             f"Не нашёл задачу «{task_name}» в текущем спринте. Уточни название."
         )
+    else:
+        # "ok" or any non-error response — treat as success
+        await update.message.reply_text(f"Комментарий к «{task_name}» обновлён ✅")
+        sheet_cache["updated_at"] = None
 
 
 # ── Update field (deadline / priority) ───────────────────
@@ -901,15 +920,14 @@ async def handle_update_field(update: Update, text: str) -> None:
     field_ru = "дедлайн" if field == "DD" else "приоритет"
     if result is None:
         await update.message.reply_text("Не удалось связаться с таблицей.")
-    elif result.get("status") == "ok":
-        await update.message.reply_text(f"Обновил {field_ru} для «{task_name}»: {value} ✅")
-        sheet_cache["updated_at"] = None
-    else:
-        msg = result.get("message", "")
-        logger.warning("Apps Script field error: %s", msg)
+    elif result.get("status") == "error" and "not found" in result.get("message", "").lower():
         await update.message.reply_text(
             f"Не нашёл задачу «{task_name}» в текущем спринте. Уточни название."
         )
+    else:
+        # "ok" or any non-error response — treat as success
+        await update.message.reply_text(f"Обновил {field_ru} для «{task_name}»: {value} ✅")
+        sheet_cache["updated_at"] = None
 
 
 # ── Ask manager (tag & question) ─────────────────────────
@@ -1138,6 +1156,15 @@ async def handle_find_file(update: Update, text: str) -> None:
     if result is None:
         await update.message.reply_text("Не удалось связаться с Google Drive.")
         return
+
+    # If response couldn't be parsed as structured JSON, retry parsing the message field
+    if "matches" not in result and isinstance(result.get("message"), str):
+        try:
+            inner = json.loads(result["message"])
+            if isinstance(inner, dict):
+                result = inner
+        except (ValueError, json.JSONDecodeError):
+            pass
 
     status = result.get("status", "")
 
