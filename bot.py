@@ -1445,7 +1445,7 @@ async def _forward_call_link(update: Update, context: ContextTypes.DEFAULT_TYPE,
     try:
         await context.bot.send_message(
             chat_id=int(RELAY_CHANNEL_ID),
-            text=f"{link} chat:{caller_chat_id}",
+            text=link,
         )
         await update.message.reply_text("Передал ссылку Ogent — подключается к записи.")
     except Exception as e:
