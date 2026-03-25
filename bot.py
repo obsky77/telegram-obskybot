@@ -1434,30 +1434,31 @@ async def call_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _forward_call_link(update: Update, context: ContextTypes.DEFAULT_TYPE, link: str) -> None:
     """
-    Send meeting link to Ogentcallbot.
-    Uses Ogent's token to post the link INTO THE SAME CHAT where the user sent /call.
-    Ogentcallbot sees it via polling and starts recording, replies in the same chat.
+    Send meeting link to Ogentcallbot via HTTP API.
+    Ogentcallbot will join the meeting and send results to the same chat.
     """
-    from telegram import Bot as TgBot
+    import requests as _req
 
-    ogent_token = os.environ.get("OGENT_BOT_TOKEN", "")
-    source_chat_id = update.effective_chat.id  # chat where /call was sent
-
-    if not ogent_token:
-        await update.message.reply_text("❌ OGENT_BOT_TOKEN не настроен.")
-        return
+    ogent_url = os.environ.get("OGENT_API_URL", "http://127.0.0.1:8080")
+    source_chat_id = update.effective_chat.id
 
     try:
-        # Send link FROM Ogentcallbot INTO the same chat
-        ogent_bot = TgBot(token=ogent_token)
-        await ogent_bot.send_message(
-            chat_id=source_chat_id,
-            text=link,
+        resp = _req.post(
+            f"{ogent_url}/record",
+            json={"url": link, "chat_id": source_chat_id},
+            timeout=10,
         )
-        await update.message.reply_text("🔴 Ogent подключается к записи...")
+        if resp.ok:
+            data = resp.json()
+            await update.message.reply_text(f"🔴 Ogent подключается к {data.get('platform', 'встрече')}...")
+        else:
+            error = resp.json().get("error", "Unknown error")
+            await update.message.reply_text(f"⚠️ {error}")
+    except _req.ConnectionError:
+        await update.message.reply_text("❌ Ogent бот не запущен.")
     except Exception as e:
-        logger.error("Failed to forward call link: %s", e)
-        await update.message.reply_text(f"❌ Не удалось передать ссылку: {e}")
+        logger.error("Failed to call Ogent API: %s", e)
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
 def _extract_meeting_link(text: str) -> str | None:
