@@ -403,7 +403,8 @@ MEETING_LINK_RE = re.compile(
     r"https?://(?:"
     r"[\w.-]*zoom\.us/[j/\w?=&-]+"            # Zoom
     r"|meet\.google\.com/[\w-]+"               # Google Meet
-    r"|jazz\.sber\.ru/[\w?=&/-]+"              # SberJazz
+    r"|jazz\.sber(?:bank)?\.ru/[\w?=&/-]+"     # SberJazz
+    r"|sberjazz\.ru/[\w?=&/-]+"               # sberjazz.ru
     r"|salute\.sber\.ru/[\w?=&/-]+"            # Salute Jazz
     r"|teams\.microsoft\.com/[\w?=&/.-]+"      # MS Teams
     r"|telemost\.yandex\.ru/[\w?=&/-]+"        # Яндекс Телемост
