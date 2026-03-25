@@ -1433,24 +1433,31 @@ async def call_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _forward_call_link(update: Update, context: ContextTypes.DEFAULT_TYPE, link: str) -> None:
-    """Post meeting link to the relay channel so Ogentcallbot picks it up."""
-    if not RELAY_CHANNEL_ID:
-        await update.message.reply_text(
-            "Канал-мост не настроен.\n"
-            "Админ должен выполнить /setrelay в нужном канале."
-        )
+    """
+    Send meeting link to Ogentcallbot.
+    Uses Ogent's token to post the link INTO THE SAME CHAT where the user sent /call.
+    Ogentcallbot sees it via polling and starts recording, replies in the same chat.
+    """
+    from telegram import Bot as TgBot
+
+    ogent_token = os.environ.get("OGENT_BOT_TOKEN", "")
+    source_chat_id = update.effective_chat.id  # chat where /call was sent
+
+    if not ogent_token:
+        await update.message.reply_text("❌ OGENT_BOT_TOKEN не настроен.")
         return
 
-    caller_chat_id = update.effective_chat.id
     try:
-        await context.bot.send_message(
-            chat_id=int(RELAY_CHANNEL_ID),
+        # Send link FROM Ogentcallbot INTO the same chat
+        ogent_bot = TgBot(token=ogent_token)
+        await ogent_bot.send_message(
+            chat_id=source_chat_id,
             text=link,
         )
-        await update.message.reply_text("Передал ссылку Ogent — подключается к записи.")
+        await update.message.reply_text("🔴 Ogent подключается к записи...")
     except Exception as e:
-        logger.error("Failed to forward call link to relay channel: %s", e)
-        await update.message.reply_text("Не получилось переслать ссылку. Проверь настройки канала.")
+        logger.error("Failed to forward call link: %s", e)
+        await update.message.reply_text(f"❌ Не удалось передать ссылку: {e}")
 
 
 def _extract_meeting_link(text: str) -> str | None:
