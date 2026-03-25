@@ -38,6 +38,7 @@ SHEET_URL = os.environ.get(
 )
 APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "")
 TELEGRAM_GROUP_ID = os.environ.get("TELEGRAM_GROUP_ID", "")
+CALL_GROUP_ID = os.environ.get("CALL_GROUP_ID", "")
 
 CACHE_TTL = 300
 sheet_cache: dict = {"data": None, "updated_at": None}
@@ -75,6 +76,7 @@ SYSTEM_PROMPT = """\
 - Показываю закрытые задачи (Done) — за эту неделю, прошлую, или все
 - Генерирую дайджест — аналитическое саммари спринта
 - Даю творческие инсайты от известных креаторов и рекламщиков
+- Пересылаю ссылки на звонки (Zoom, Jazz, Meet) боту-рекордеру — кинь ссылку или /call
 - Со мной можно общаться цепочкой вопросов — помню контекст разговора
 
 ЕСЛИ ВОПРОС НЕ ПО ТЕМЕ
@@ -385,6 +387,25 @@ FIND_FILE_RE = re.compile(
     # "скинь / кинь [тип файла]"
     r"|(скинь|кинь|пришли)\s+(файл|презентац|преза|материал|бриф|видео|документ))",
     re.IGNORECASE
+)
+
+# Call / meeting link detection
+CALL_RE = re.compile(
+    r"(подключись|зайди|присоединись|запиши)\s+(к|на|в)\s+(звонок|встреч|созвон|колл|конференц|зум|zoom)"
+    r"|запиши\s+(встреч|звонок|созвон|колл)"
+    r"|подключись\s+к\s+зуму"
+    r"|зайди\s+(в|на)\s+(зум|zoom|meet|jazz|джаз)",
+    re.IGNORECASE
+)
+MEETING_LINK_RE = re.compile(
+    r"https?://(?:"
+    r"[\w.-]*zoom\.us/[j/\w?=&-]+"            # Zoom
+    r"|meet\.google\.com/[\w-]+"               # Google Meet
+    r"|jazz\.sber\.ru/[\w?=&/-]+"              # SberJazz
+    r"|salute\.sber\.ru/[\w?=&/-]+"            # Salute Jazz
+    r"|teams\.microsoft\.com/[\w?=&/.-]+"      # MS Teams
+    r"|telemost\.yandex\.ru/[\w?=&/-]+"        # Яндекс Телемост
+    r")"
 )
 
 
@@ -1306,6 +1327,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\n"
         "/digest — аналитическое саммари спринта\n"
         "\n"
+        "/call [ссылка] — переслать ссылку на встречу боту-рекордеру\n"
+        "Или просто кинь ссылку на Zoom/Jazz/Meet — сам подхвачу.\n"
+        "\n"
         "Можно спрашивать цепочкой — помню контекст разговора.\n"
         "/clear — начать заново\n"
         "\n"
@@ -1353,6 +1377,61 @@ async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Добавь в Railway переменную:\n"
         f"TELEGRAM_GROUP_ID = {chat.id}"
     )
+
+
+async def setcallgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run this command in a group to register it as the call-forwarding target."""
+    global CALL_GROUP_ID
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text(
+            "Эту команду нужно запустить в группе, куда пересылать ссылки на звонки."
+        )
+        return
+    CALL_GROUP_ID = str(chat.id)
+    await update.message.reply_text(
+        f"Группа для звонков установлена: {chat.id}\n\n"
+        f"Чтобы сохранить между перезапусками, добавь в Railway:\n"
+        f"CALL_GROUP_ID = {chat.id}"
+    )
+
+
+async def call_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Forward a meeting link to the recorder bot group via /call <link>."""
+    args_text = " ".join(context.args) if context.args else ""
+    link = _extract_meeting_link(args_text)
+    if not link:
+        await update.message.reply_text(
+            "Скинь ссылку на встречу после команды.\n"
+            "Например: /call https://zoom.us/j/123456"
+        )
+        return
+    await _forward_call_link(update, context, link)
+
+
+async def _forward_call_link(update: Update, context: ContextTypes.DEFAULT_TYPE, link: str) -> None:
+    """Send /call <link> to the recorder bot group."""
+    if not CALL_GROUP_ID:
+        await update.message.reply_text(
+            "Не настроена группа для записи звонков.\n"
+            "Админ должен выполнить /setcallgroup в нужной группе."
+        )
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=int(CALL_GROUP_ID),
+            text=f"/call {link}",
+        )
+        await update.message.reply_text(f"Передал ссылку на запись: {link}")
+    except Exception as e:
+        logger.error("Failed to forward call link: %s", e)
+        await update.message.reply_text("Не получилось переслать ссылку. Проверь настройки группы.")
+
+
+def _extract_meeting_link(text: str) -> str | None:
+    """Extract the first meeting URL from text."""
+    m = MEETING_LINK_RE.search(text)
+    return m.group(0) if m else None
 
 
 async def sprint_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1492,6 +1571,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await handle_inbox_details(update, text)
         return
 
+    # ── Call / meeting link ──
+    meeting_link = _extract_meeting_link(text)
+    if meeting_link:
+        await _forward_call_link(update, context, meeting_link)
+        return
+    if CALL_RE.search(text.strip()):
+        await update.message.reply_text(
+            "Скинь ссылку на встречу — перешлю боту-рекордеру.\n"
+            "Или: /call https://zoom.us/j/123456"
+        )
+        return
+
     # ── Find file / Drive folder ──
     if FIND_FILE_RE.search(text.strip()):
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -1605,6 +1696,8 @@ def main() -> None:
     app.add_handler(CommandHandler("report", report))    # alias → sprint
     app.add_handler(CommandHandler("fire", hot_cmd))     # alias → hot
     app.add_handler(CommandHandler("setgroup", setgroup))
+    app.add_handler(CommandHandler("setcallgroup", setcallgroup))
+    app.add_handler(CommandHandler("call", call_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot started")
