@@ -1385,17 +1385,20 @@ async def setrelay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Run in a channel to register it as the relay for Ogentcallbot."""
     global RELAY_CHANNEL_ID
     chat = update.effective_chat
+    msg = update.effective_message
     if chat.type != "channel":
-        await update.message.reply_text(
-            "Эту команду нужно запустить в канале, где оба бота — админы."
-        )
+        if msg:
+            await msg.reply_text(
+                "Эту команду нужно запустить в канале, где оба бота — админы."
+            )
         return
     RELAY_CHANNEL_ID = str(chat.id)
-    await update.message.reply_text(
-        f"Канал-мост установлен: {chat.id}\n\n"
-        f"Чтобы сохранить между перезапусками, добавь в Railway:\n"
-        f"RELAY_CHANNEL_ID = {chat.id}"
-    )
+    if msg:
+        await msg.reply_text(
+            f"Канал-мост установлен: {chat.id}\n\n"
+            f"Чтобы сохранить между перезапусками, добавь в Railway:\n"
+            f"RELAY_CHANNEL_ID = {chat.id}"
+        )
 
 
 async def setcallgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1717,7 +1720,7 @@ def main() -> None:
     app.add_handler(CommandHandler("report", report))    # alias → sprint
     app.add_handler(CommandHandler("fire", hot_cmd))     # alias → hot
     app.add_handler(CommandHandler("setgroup", setgroup))
-    app.add_handler(CommandHandler("setrelay", setrelay))
+    app.add_handler(CommandHandler("setrelay", setrelay, filters=filters.UpdateType.CHANNEL_POST))
     app.add_handler(CommandHandler("setcallgroup", setcallgroup))
     app.add_handler(CommandHandler("call", call_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -1725,7 +1728,7 @@ def main() -> None:
     logger.info("Bot started")
     app.run_polling(
         drop_pending_updates=True,
-        allowed_updates=["message", "edited_message", "callback_query"],
+        allowed_updates=["message", "edited_message", "callback_query", "channel_post"],
     )
 
 
