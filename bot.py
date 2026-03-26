@@ -1447,13 +1447,20 @@ async def _forward_call_link(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     source_chat_id = update.effective_chat.id
+    is_private = update.effective_chat.type == "private"
+    # Results go to: the same chat where user sent /call
+    # If private chat → user's chat_id
+    # If group/channel → that group/channel id
+    results_chat_id = source_chat_id
     try:
-        # Post to channel: "link|chat_id" format
         await context.bot.send_message(
             chat_id=int(relay_id),
-            text=f"{link}|{source_chat_id}",
+            text=f"{link}|{results_chat_id}",
         )
-        await update.message.reply_text("🔴 Передал Ogent — подключается к записи...")
+        if is_private:
+            await update.message.reply_text("🔴 Ogent подключается — результаты пришлю сюда.")
+        else:
+            await update.message.reply_text("🔴 Ogent подключается — результаты будут здесь.")
     except Exception as e:
         logger.error("Failed to forward call link: %s", e)
         await update.message.reply_text(f"❌ Не удалось переслать: {e}")
